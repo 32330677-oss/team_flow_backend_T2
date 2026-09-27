@@ -2,11 +2,10 @@
 const db = require('../config/db');
 const settingsCache = require('../services/settingsCache');
 
-// 1. Fetch pending/rejected records for review
 exports.getPendingRecords = async (req, res) => {
     try {
         const [rows] = await db.execute(
-            `SELECT a.attendance_id, a.worker_id, a.site_id,
+            `SELECT a.attendance_id, a.worker_id, a.site_id, a.shift_type,
                     a.check_in_time, a.check_out_time,
                     a.total_working_hours, a.overtime_hours,
                     a.management_leave_hours, a.status, a.attendance_status,

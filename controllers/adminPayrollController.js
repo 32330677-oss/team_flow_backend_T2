@@ -108,24 +108,26 @@ async function generatePayrollBatch(req, res) {
     }
 
     const attParams = [start_date, end_date];
-    let attSql = `
-      SELECT a.attendance_id, a.worker_id, w.full_name AS worker_name, w.payment_type,
-             a.record_date, a.site_id, a.total_working_hours, a.overtime_hours,
-             a.attendance_status, a.standard_minutes_snapshot,
-             (
-               SELECT wsa2.contract_id
-               FROM workersiteassignments wsa2
-               WHERE wsa2.worker_id = a.worker_id
-                 AND wsa2.site_id = a.site_id
-                 AND wsa2.assigned_date <= a.record_date
-                 AND (wsa2.unassigned_date IS NULL OR wsa2.unassigned_date > a.record_date)
-               ORDER BY wsa2.assigned_date DESC, wsa2.assignment_id DESC
-               LIMIT 1
-             ) AS contract_id
-      FROM attendance a
-      JOIN workers w ON w.worker_id = a.worker_id
-      WHERE a.record_date BETWEEN ? AND ?
-        AND a.status = 'Approved'`;
+let attSql = `
+  SELECT a.attendance_id, a.worker_id, w.full_name AS worker_name, w.payment_type,
+         a.record_date, a.site_id, a.shift_type, a.total_working_hours, a.overtime_hours,
+         a.attendance_status, a.standard_minutes_snapshot,
+         (
+           SELECT wsa2.contract_id
+           FROM workersiteassignments wsa2
+           WHERE wsa2.worker_id = a.worker_id
+             AND wsa2.site_id = a.site_id
+             AND wsa2.shift_type = a.shift_type
+             AND wsa2.assigned_date <= a.record_date
+             AND (wsa2.unassigned_date IS NULL OR wsa2.unassigned_date > a.record_date)
+           ORDER BY wsa2.assigned_date DESC, wsa2.assignment_id DESC
+           LIMIT 1
+         ) AS contract_id
+  FROM attendance a
+  JOIN workers w ON w.worker_id = a.worker_id
+  WHERE a.record_date BETWEEN ? AND ?
+    AND a.status = 'Approved'`;
+
     if (scopedSite) { attSql += ' AND a.site_id = ?'; attParams.push(site_id); }
     attSql += ' ORDER BY w.full_name, a.record_date';
 
@@ -1101,7 +1103,15 @@ function shapeArabicAware(str) {
     const dailyMap = new Map();
     for (const a of attRows) {
       const key = `${a.worker_id}|${a.site_id}|${a.record_date}`;
-      dailyMap.set(key, { reg: Number(a.total_working_hours || 0), ot: Number(a.overtime_hours || 0) });
+     const dailyMap = new Map();
+for (const a of attRows) {
+    const key = `${a.worker_id}|${a.site_id}|${a.record_date}`;
+    const prior = dailyMap.get(key) || { reg: 0, ot: 0 };
+    dailyMap.set(key, {
+        reg: prior.reg + Number(a.total_working_hours || 0),
+        ot: prior.ot + Number(a.overtime_hours || 0),
+    });
+}
     }
     function getDaily(workerId, siteId, date) {
       return dailyMap.get(`${workerId}|${siteId}|${date}`) || { reg: 0, ot: 0 };
@@ -1530,19 +1540,19 @@ async function exportDailyAttendanceExcel(req, res) {
       params.push(site_id);
     }
 
-    const [rows] = await pool.execute(
-      `SELECT a.record_date, w.worker_unique_id, w.full_name AS worker_name,
-              s.site_name, a.attendance_status, a.status AS workflow_status,
-              a.check_in_time, a.check_out_time, a.total_working_hours,
-              a.overtime_hours, a.management_leave_hours, a.remarks,
-              a.admin_rejection_notes
-       FROM attendance a
-       JOIN workers w ON w.worker_id = a.worker_id
-       JOIN sites s ON s.site_id = a.site_id
-       WHERE a.record_date = ?${siteFilter}
-       ORDER BY s.site_name, w.full_name`,
-      params
-    );
+ const [rows] = await pool.execute(
+    `SELECT a.record_date, a.shift_type, w.worker_unique_id, w.full_name AS worker_name,
+            s.site_name, a.attendance_status, a.status AS workflow_status,
+            a.check_in_time, a.check_out_time, a.total_working_hours,
+            a.overtime_hours, a.management_leave_hours, a.remarks,
+            a.admin_rejection_notes
+     FROM attendance a
+     JOIN workers w ON w.worker_id = a.worker_id
+     JOIN sites s ON s.site_id = a.site_id
+     WHERE a.record_date = ?${siteFilter}
+     ORDER BY s.site_name, a.shift_type, w.full_name`,
+    params
+);
 
     const workbook = new ExcelJS.Workbook();
     const sheet = workbook.addWorksheet('Daily Attendance');
@@ -1551,20 +1561,21 @@ async function exportDailyAttendanceExcel(req, res) {
     const logoId = workbook.addImage({ filename: logoPath, extension: 'png' });
     sheet.addImage(logoId, { tl: { col: 0.2, row: 0.15 }, ext: { width: 150, height: 60 } });
 
-    sheet.columns = [
-      { header: 'No.', key: 'number', width: 8 },
-      { header: 'Worker ID', key: 'worker_id', width: 16 },
-      { header: 'Worker Name', key: 'worker_name', width: 28 },
-      { header: 'Site', key: 'site_name', width: 22 },
-      { header: 'Attendance Status', key: 'attendance_status', width: 20 },
-      { header: 'Workflow Status', key: 'workflow_status', width: 18 },
-      { header: 'Check In', key: 'check_in', width: 22 },
-      { header: 'Check Out', key: 'check_out', width: 22 },
-      { header: 'Regular Hours', key: 'regular_hours', width: 16 },
-      { header: 'Overtime Hours', key: 'overtime_hours', width: 16 },
-      { header: 'Management Leave Hours', key: 'management_leave_hours', width: 24 },
-      { header: 'Remarks', key: 'remarks', width: 36 },
-    ];
+sheet.columns = [
+    { header: 'No.', key: 'number', width: 8 },
+    { header: 'Worker ID', key: 'worker_id', width: 16 },
+    { header: 'Worker Name', key: 'worker_name', width: 28 },
+    { header: 'Site', key: 'site_name', width: 22 },
+    { header: 'Shift', key: 'shift_type', width: 10 },   // ← جديد
+    { header: 'Attendance Status', key: 'attendance_status', width: 20 },
+    { header: 'Workflow Status', key: 'workflow_status', width: 18 },
+    { header: 'Check In', key: 'check_in', width: 22 },
+    { header: 'Check Out', key: 'check_out', width: 22 },
+    { header: 'Regular Hours', key: 'regular_hours', width: 16 },
+    { header: 'Overtime Hours', key: 'overtime_hours', width: 16 },
+    { header: 'Management Leave Hours', key: 'management_leave_hours', width: 24 },
+    { header: 'Remarks', key: 'remarks', width: 36 },
+];
 
     sheet.mergeCells('A1:L1');
     sheet.getCell('A1').value = `Daily Attendance Report - ${date}`;
@@ -1574,12 +1585,13 @@ async function exportDailyAttendanceExcel(req, res) {
     sheet.getRow(2).height = 24;
     sheet.getRow(4).values = sheet.columns.map((column) => column.header);
 
-    rows.forEach((row, index) => {
-      sheet.addRow({
+rows.forEach((row, index) => {
+    sheet.addRow({
         number: index + 1,
         worker_id: row.worker_unique_id,
         worker_name: row.worker_name,
         site_name: row.site_name,
+        shift_type: row.shift_type,   // ← جديد
         attendance_status: row.attendance_status || 'Present',
         workflow_status: row.workflow_status,
         check_in: row.check_in_time || '',
@@ -1588,8 +1600,8 @@ async function exportDailyAttendanceExcel(req, res) {
         overtime_hours: Number(row.overtime_hours || 0),
         management_leave_hours: Number(row.management_leave_hours || 0),
         remarks: row.remarks || '',
-      });
     });
+});
 
     sheet.getRow(1).font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
     sheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };

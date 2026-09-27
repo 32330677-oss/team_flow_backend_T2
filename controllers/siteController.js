@@ -117,10 +117,11 @@ exports.toggleSiteStatus = async (req, res) => {
     }
 };
 
+// أضف بعد getAllSites الموجودة — استبدل getAllSites بهذا:
 exports.getAllSites = async (req, res) => {
     try {
         const query = `
-            SELECT site_id, site_name 
+            SELECT site_id, site_name, supports_shifts
             FROM sites 
             WHERE site_status = 'Active'
             ORDER BY site_name ASC
@@ -133,21 +134,65 @@ exports.getAllSites = async (req, res) => {
     }
 };
 
+// استبدل getMySites الموجودة بهذا:
 exports.getMySites = async (req, res) => {
-    const supervisorId = req.user.user_id; 
+    const supervisorId = req.user.user_id;
     try {
         const query = `
-            SELECT s.*, c.contract_name, p.project_name
+            SELECT DISTINCT s.*, c.contract_name, p.project_name,
+                   COALESCE(ss.shift_type, 'Day') AS my_shift_type
             FROM sites s
             LEFT JOIN contracts c ON s.contract_id = c.contract_id
             LEFT JOIN projects p ON c.project_id = p.project_id
-            WHERE s.supervisor_id = ? AND s.site_status = 'Active'
+            LEFT JOIN site_shifts ss ON ss.site_id = s.site_id AND ss.supervisor_id = ?
+            WHERE s.site_status = 'Active'
+              AND (
+                    (s.supports_shifts = 0 AND s.supervisor_id = ?)
+                    OR (s.supports_shifts = 1 AND ss.supervisor_id = ?)
+                  )
             ORDER BY s.created_at DESC
         `;
-        const [rows] = await db.query(query, [supervisorId]);
+        const [rows] = await db.query(query, [supervisorId, supervisorId, supervisorId]);
         return res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
         console.error("🚨 FETCH MY SITES ERROR:", error);
         return res.status(500).json({ status: 'error', message: 'Failed to fetch your sites' });
+    }
+};
+
+// NEW: إدارة مشرفي الورديات
+exports.getSiteShifts = async (req, res) => {
+    const { siteId } = req.params;
+    try {
+        const [rows] = await db.query(
+            `SELECT ss.site_shift_id, ss.shift_type, ss.supervisor_id, u.full_name AS supervisor_name
+             FROM site_shifts ss LEFT JOIN users u ON u.user_id = ss.supervisor_id
+             WHERE ss.site_id = ? ORDER BY ss.shift_type`,
+            [siteId]
+        );
+        res.status(200).json({ status: 'success', data: rows });
+    } catch (error) {
+        console.error('🚨 GET SITE SHIFTS ERROR:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to fetch site shifts.' });
+    }
+};
+
+exports.upsertSiteShiftSupervisor = async (req, res) => {
+    const { siteId } = req.params;
+    const { shift_type, supervisor_id } = req.body;
+    if (!['Day', 'Night'].includes(shift_type)) {
+        return res.status(400).json({ status: 'error', message: 'shift_type must be Day or Night' });
+    }
+    try {
+        await db.query(
+            `INSERT INTO site_shifts (site_id, shift_type, supervisor_id)
+             VALUES (?, ?, ?)
+             ON DUPLICATE KEY UPDATE supervisor_id = VALUES(supervisor_id)`,
+            [siteId, shift_type, supervisor_id || null]
+        );
+        res.status(200).json({ status: 'success', message: 'Shift supervisor updated' });
+    } catch (error) {
+        console.error('🚨 UPSERT SITE SHIFT ERROR:', error);
+        res.status(500).json({ status: 'error', message: 'Failed to update shift supervisor.' });
     }
 };

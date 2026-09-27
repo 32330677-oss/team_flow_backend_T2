@@ -59,21 +59,36 @@ function normalizedCompensationValues(payment_type, daily_rate, regular_hourly_r
     return { daily_rate: Number(daily_rate), regular_hourly_rate: null, overtime_hourly_rate: null };
 }
 
-// 1. جلب جميع العمال
 exports.getAllWorkers = async (req, res) => {
     try {
         const query = `
             SELECT w.*,
-                   wsa.site_id AS assigned_site_id,
-                   s.site_name AS assigned_site_name
+                   (
+                     SELECT JSON_ARRAYAGG(
+                       JSON_OBJECT('site_id', wsa2.site_id, 'site_name', s2.site_name, 'shift_type', wsa2.shift_type)
+                     )
+                     FROM workersiteassignments wsa2
+                     JOIN sites s2 ON s2.site_id = wsa2.site_id
+                     WHERE wsa2.worker_id = w.worker_id AND wsa2.unassigned_date IS NULL
+                   ) AS assignments_json
             FROM workers w
-            LEFT JOIN workersiteassignments wsa
-                   ON wsa.worker_id = w.worker_id AND wsa.unassigned_date IS NULL
-            LEFT JOIN sites s ON s.site_id = wsa.site_id
             ORDER BY w.created_at DESC`;
         const [rows] = await db.query(query);
 
         const processedRows = rows.map(row => {
+            let assignments = [];
+            try {
+                assignments = row.assignments_json ? JSON.parse(row.assignments_json) : [];
+            } catch (_) {
+                assignments = [];
+            }
+            row.assigned_site_id = assignments[0]?.site_id ?? null;
+            row.assigned_site_name = assignments.length
+                ? assignments.map(a => `${a.site_name} (${a.shift_type})`).join(', ')
+                : null;
+            row.assignments = assignments;
+            delete row.assignments_json;
+
             if (row.personal_photo && !row.personal_photo.startsWith('http')) {
                 row.personal_photo = `${req.protocol}://${req.get('host')}/${row.personal_photo.replace(/\\/g, '/')}`;
             }

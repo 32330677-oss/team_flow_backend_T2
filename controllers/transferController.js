@@ -3,61 +3,73 @@ const path = require('path');
 const fs = require('fs');
 const { generateTransferRequestDocx } = require('../services/transferDocumentService');
 
-// 1. Create a new transfer request (by Supervisor)
+function normalizeShift(value) {
+    return ['Day', 'Night'].includes(value) ? value : 'Day';
+}
+
+async function verifySupervisorShiftScope(userId, siteId, shiftType) {
+    const [rows] = await db.execute(
+        `SELECT 1 FROM site_shifts WHERE site_id = ? AND shift_type = ? AND supervisor_id = ?
+         UNION
+         SELECT 1 FROM sites WHERE site_id = ? AND supervisor_id = ? AND supports_shifts = 0
+         LIMIT 1`,
+        [siteId, shiftType, userId, siteId, userId]
+    );
+    return rows.length > 0;
+}
+
+// 1. إنشاء طلب تحويل جديد
 exports.createTransferRequest = async (req, res) => {
     const { worker_id, current_site_id, target_site_id, transfer_reason } = req.body;
+    const current_shift_type = normalizeShift(req.body.current_shift_type);
+    const target_shift_type = normalizeShift(req.body.target_shift_type);
     const requested_by_user_id = req.user.user_id;
 
     if (!worker_id || !current_site_id || !target_site_id) {
         return res.status(400).json({ status: 'error', message: 'Please specify the worker, current site, and target site.' });
     }
 
-    if (current_site_id === target_site_id) {
-        return res.status(400).json({ status: 'error', message: 'The target site cannot be the same as the current site.' });
+    if (current_site_id === target_site_id && current_shift_type === target_shift_type) {
+        return res.status(400).json({ status: 'error', message: 'The target site/shift cannot be the same as the current one.' });
     }
 
     try {
         if (req.user.role !== 'Admin') {
-            const [checkSite] = await db.execute(
-                'SELECT 1 FROM sites WHERE site_id = ? AND supervisor_id = ? LIMIT 1',
-                [current_site_id, requested_by_user_id]
-            );
-            if (checkSite.length === 0) {
-                return res.status(403).json({ status: 'error', message: 'You are not authorized to transfer workers from this site.' });
+            const isAuthorized = await verifySupervisorShiftScope(requested_by_user_id, current_site_id, current_shift_type);
+            if (!isAuthorized) {
+                return res.status(403).json({ status: 'error', message: 'You are not authorized to transfer workers from this site/shift.' });
             }
         }
 
-const [existing] = await db.query(
-    `SELECT request_id FROM worker_transfer_requests WHERE worker_id = ? AND status = 'Pending'`,
-    [worker_id]
-);
-if (existing.length > 0) {
-    return res.status(400).json({ status: 'error', message: 'A pending transfer request already exists for this worker.' });
-}
+        const [existing] = await db.query(
+            `SELECT request_id FROM worker_transfer_requests WHERE worker_id = ? AND status = 'Pending'`,
+            [worker_id]
+        );
+        if (existing.length > 0) {
+            return res.status(400).json({ status: 'error', message: 'A pending transfer request already exists for this worker.' });
+        }
 
-let result;
-try {
-    [result] = await db.query(
-        `INSERT INTO worker_transfer_requests
-         (worker_id, current_site_id, target_site_id, requested_by_user_id, status, admin_notes, created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'Pending', ?, NOW(), NOW())`,
-        [worker_id, current_site_id, target_site_id, requested_by_user_id, transfer_reason || null]
-    );
-} catch (insertError) {
-    if (insertError.code === 'ER_DUP_ENTRY' || insertError.errno === 1062) {
-        // Two concurrent requests raced past the SELECT above; the new
-        // uq_wtr_pending_worker partial-unique index catches it here.
-        return res.status(409).json({
-            status: 'error',
-            message: 'A pending transfer request already exists for this worker (created by a concurrent request).'
-        });
-    }
-    throw insertError;
-}
-const requestId = result.insertId;
-// ...rest unchanged (docx generation, response, etc.)
+        let result;
+        try {
+            [result] = await db.query(
+                `INSERT INTO worker_transfer_requests
+                 (worker_id, current_site_id, current_shift_type, target_site_id, target_shift_type,
+                  requested_by_user_id, status, admin_notes, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?, NOW(), NOW())`,
+                [worker_id, current_site_id, current_shift_type, target_site_id, target_shift_type,
+                 requested_by_user_id, transfer_reason || null]
+            );
+        } catch (insertError) {
+            if (insertError.code === 'ER_DUP_ENTRY' || insertError.errno === 1062) {
+                return res.status(409).json({
+                    status: 'error',
+                    message: 'A pending transfer request already exists for this worker (created by a concurrent request).'
+                });
+            }
+            throw insertError;
+        }
+        const requestId = result.insertId;
 
-        // --- Generate the official Word document (best-effort; never blocks the electronic request) ---
         let documentPath = null;
         try {
             const [[workerRow]] = await db.query(
@@ -86,8 +98,8 @@ const requestId = result.insertId;
                 companyInfo: process.env.COMPANY_INFO || null,
                 requestDate: new Date().toISOString().slice(0, 10),
                 worker: workerRow || {},
-                currentSiteName: currentSiteRow?.site_name,
-                targetSiteName: targetSiteRow?.site_name,
+                currentSiteName: currentSiteRow?.site_name ? `${currentSiteRow.site_name} (${current_shift_type})` : null,
+                targetSiteName: targetSiteRow?.site_name ? `${targetSiteRow.site_name} (${target_shift_type})` : null,
                 contractName: currentSiteRow?.contract_name,
                 requesterName: requesterRow?.full_name,
                 requesterPosition: requesterRow?.role,
@@ -100,7 +112,6 @@ const requestId = result.insertId;
             );
         } catch (docError) {
             console.error('TRANSFER DOCX GENERATION ERROR:', docError);
-            // Electronic request still succeeds even if the Word file couldn't be built.
         }
 
         res.status(201).json({
@@ -115,12 +126,13 @@ const requestId = result.insertId;
     }
 };
 
-// 2. Fetch pending requests (for Admin) — unchanged, document_path not needed in the list
+// 2. جلب الطلبات المعلقة
 exports.getPendingTransfers = async (req, res) => {
     try {
         const [rows] = await db.query(
             `SELECT
                 t.request_id, t.status, t.admin_notes, t.created_at, t.document_path,
+                t.current_shift_type, t.target_shift_type,
                 w.worker_id, w.full_name AS worker_name,
                 cs.site_id AS current_site_id, cs.site_name AS current_site_name,
                 ts.site_id AS target_site_id, ts.site_name AS target_site_name,
@@ -140,10 +152,10 @@ exports.getPendingTransfers = async (req, res) => {
     }
 };
 
-// 3. Review request (Accept / Reject) - Admin only
+// 3. مراجعة الطلب
 exports.reviewTransferRequest = async (req, res) => {
     const { id } = req.params;
-    const { status, admin_notes } = req.body; // status: 'Approved' | 'Rejected'
+    const { status, admin_notes } = req.body;
     const adminId = req.user.user_id;
 
     if (!['Approved', 'Rejected'].includes(status)) {
@@ -166,15 +178,13 @@ exports.reviewTransferRequest = async (req, res) => {
         }
 
         if (status === 'Approved') {
-            // A. End current assignment at the old site
             await connection.execute(
                 `UPDATE workersiteassignments 
                  SET unassigned_date = NOW(), updated_at = NOW() 
-                 WHERE worker_id = ? AND site_id = ? AND unassigned_date IS NULL`,
-                [request.worker_id, request.current_site_id]
+                 WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND unassigned_date IS NULL`,
+                [request.worker_id, request.current_site_id, request.current_shift_type]
             );
 
-            // B. Fetch contract_id for the target site
             const [targetSite] = await connection.execute(
                 `SELECT contract_id FROM sites WHERE site_id = ? LIMIT 1`,
                 [request.target_site_id]
@@ -182,16 +192,14 @@ exports.reviewTransferRequest = async (req, res) => {
             if (targetSite.length === 0) throw new Error('Target site does not exist.');
             const contract_id = targetSite[0].contract_id;
 
-            // C. Create new assignment at the target site
             await connection.execute(
                 `INSERT INTO workersiteassignments 
-                 (worker_id, site_id, contract_id, assigned_by_user_id, assigned_date, created_at, updated_at) 
-                 VALUES (?, ?, ?, ?, CURDATE(), NOW(), NOW())`,
-                [request.worker_id, request.target_site_id, contract_id, adminId]
+                 (worker_id, site_id, contract_id, assigned_by_user_id, assigned_date, shift_type, created_at, updated_at) 
+                 VALUES (?, ?, ?, ?, CURDATE(), ?, NOW(), NOW())`,
+                [request.worker_id, request.target_site_id, contract_id, adminId, request.target_shift_type]
             );
         }
 
-        // D. Update transfer request status
         await connection.execute(
             `UPDATE worker_transfer_requests 
              SET status = ?, admin_notes = ?, updated_at = NOW() 
@@ -213,15 +221,14 @@ exports.reviewTransferRequest = async (req, res) => {
     }
 };
 
-// 4. Download the official Word document (Admin, or the Supervisor who created it)
-// 4. Download the official Word document (Admin, or the Supervisor who created it)
+// 4. تحميل مستند التحويل — بدون تغيير جوهري (فقط أسماء الحقول بالتوليد أعلاه)
 exports.downloadTransferDocument = async (req, res) => {
     const { id } = req.params;
     try {
-        // 1. جلب بيانات الطلب كاملة مع تفاصيل العامل والمواقع والمستخدم لتكون جاهزة عند الحاجة للتوليد الفوري
         const [[row]] = await db.query(
             `SELECT 
                 t.document_path, t.requested_by_user_id, t.created_at, t.admin_notes,
+                t.current_shift_type, t.target_shift_type,
                 w.full_name, w.worker_unique_id, w.job_position, w.nationality, w.phone_number, w.hire_date,
                 cs.site_name AS current_site_name, c.contract_name,
                 ts.site_name AS target_site_name,
@@ -240,7 +247,6 @@ exports.downloadTransferDocument = async (req, res) => {
             return res.status(404).json({ status: 'error', message: 'Transfer request not found.' });
         }
 
-        // 2. التحقق من الصلاحيات (Admin أو صاحب الطلب Supervisor)
         const isOwner = req.user.role === 'Supervisor' && req.user.user_id === row.requested_by_user_id;
         if (req.user.role !== 'Admin' && !isOwner) {
             return res.status(403).json({ status: 'error', message: 'You are not authorized to download this document.' });
@@ -248,7 +254,6 @@ exports.downloadTransferDocument = async (req, res) => {
 
         let absolutePath = row.document_path ? path.join(__dirname, '..', row.document_path) : null;
 
-        // 3. التوليد التلقائي الفوري (On-the-Fly) إذا كان مسار الملف فارغاً أو غير موجود على السيرفر
         if (!absolutePath || !fs.existsSync(absolutePath)) {
             try {
                 const generatedPath = await generateTransferRequestDocx({
@@ -264,15 +269,14 @@ exports.downloadTransferDocument = async (req, res) => {
                         phone_number: row.phone_number,
                         hire_date: row.hire_date,
                     },
-                    currentSiteName: row.current_site_name,
-                    targetSiteName: row.target_site_name,
+                    currentSiteName: `${row.current_site_name} (${row.current_shift_type})`,
+                    targetSiteName: `${row.target_site_name} (${row.target_shift_type})`,
                     contractName: row.contract_name,
                     requesterName: row.requester_name,
                     requesterPosition: row.requester_role,
                     transferReason: row.admin_notes,
                 });
 
-                // تحديث المسار في قاعدة البيانات للمستقبل
                 await db.query(
                     `UPDATE worker_transfer_requests SET document_path = ? WHERE request_id = ?`,
                     [generatedPath, id]
@@ -285,9 +289,7 @@ exports.downloadTransferDocument = async (req, res) => {
             }
         }
 
-        // 4. إرسال الملف بنجاح
         return res.download(absolutePath);
-
     } catch (error) {
         console.error('DOWNLOAD TRANSFER DOCUMENT ERROR:', error);
         res.status(500).json({ status: 'error', message: 'An error occurred while downloading the document.' });
