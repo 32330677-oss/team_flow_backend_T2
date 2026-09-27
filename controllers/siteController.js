@@ -1,22 +1,55 @@
 const db = require('../config/db');
 const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
 
-// Get sites by contract ID
 exports.getSitesByContract = async (req, res) => {
     const { contractId } = req.params;
+
     try {
         const query = `
-            SELECT s.*, u.full_name AS supervisor_name 
+            SELECT
+                s.*,
+                u.full_name AS supervisor_name,
+
+                (
+                    SELECT u_day.full_name
+                    FROM site_shifts ss_day
+                    LEFT JOIN users u_day
+                        ON ss_day.supervisor_id = u_day.user_id
+                    WHERE ss_day.site_id = s.site_id
+                      AND ss_day.shift_type = 'Day'
+                    LIMIT 1
+                ) AS day_supervisor_name,
+
+                (
+                    SELECT u_night.full_name
+                    FROM site_shifts ss_night
+                    LEFT JOIN users u_night
+                        ON ss_night.supervisor_id = u_night.user_id
+                    WHERE ss_night.site_id = s.site_id
+                      AND ss_night.shift_type = 'Night'
+                    LIMIT 1
+                ) AS night_supervisor_name
+
             FROM sites s
-            LEFT JOIN users u ON s.supervisor_id = u.user_id
-            WHERE s.contract_id = ? 
+            LEFT JOIN users u
+                ON s.supervisor_id = u.user_id
+            WHERE s.contract_id = ?
             ORDER BY s.created_at DESC
         `;
+
         const [rows] = await db.query(query, [contractId]);
-        return res.status(200).json({ status: 'success', data: rows });
+
+        return res.status(200).json({
+            status: 'success',
+            data: rows
+        });
     } catch (error) {
         console.error("🚨 FETCH ERROR:", error);
-        return res.status(500).json({ status: 'error', message: 'Failed to fetch contract sites' });
+
+        return res.status(500).json({
+            status: 'error',
+            message: 'Failed to fetch contract sites'
+        });
     }
 };
 
