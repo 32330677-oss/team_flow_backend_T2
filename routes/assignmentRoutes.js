@@ -88,7 +88,27 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
                 message: `This worker is already assigned to this site's ${shift_type} shift.`
             });
         }
+        // منع العامل من امتلاك أكثر من شيفت فعال في نفس الموقع
+        const [sameSiteAnyShift] = await db.query(
+            `SELECT assignment_id, shift_type
+             FROM workersiteassignments
+             WHERE worker_id = ?
+               AND site_id = ?
+               AND unassigned_date IS NULL
+             LIMIT 1`,
+            [worker_id, site_id]
+        );
 
+        if (sameSiteAnyShift.length > 0) {
+            const current = sameSiteAnyShift[0];
+
+            return res.status(400).json({
+                status: 'fail',
+                message: `This worker is already assigned to this site in the ${current.shift_type} shift. A worker cannot be assigned to both Day and Night shifts at the same site.`,
+                current_site_id: site_id,
+                current_shift_type: current.shift_type
+            });
+        }
         // منع وجود العامل بموقع فيزيائي مختلف تماماً (السلوك القديم محفوظ)
         const [activeAssignment] = await db.query(
             `SELECT wsa.assignment_id, wsa.site_id, wsa.shift_type, s.site_name AS current_site_name

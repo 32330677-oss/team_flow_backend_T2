@@ -74,19 +74,35 @@ exports.getAllWorkers = async (req, res) => {
             FROM workers w
             ORDER BY w.created_at DESC`;
         const [rows] = await db.query(query);
+        console.log('T2 WORKERS DB CHECK:', {
+    dbName: process.env.DB_NAME,
+    worker38Assignments: rows.find(r => r.worker_id === 38)?.assignments_json
+});
 
         const processedRows = rows.map(row => {
-            let assignments = [];
-            try {
-                assignments = row.assignments_json ? JSON.parse(row.assignments_json) : [];
-            } catch (_) {
-                assignments = [];
-            }
+    let assignments = [];
+
+try {
+    if (Array.isArray(row.assignments_json)) {
+        assignments = row.assignments_json;
+    } else if (row.assignments_json) {
+        assignments = JSON.parse(row.assignments_json);
+    }
+} catch (_) {
+    assignments = [];
+}
             row.assigned_site_id = assignments[0]?.site_id ?? null;
             row.assigned_site_name = assignments.length
                 ? assignments.map(a => `${a.site_name} (${a.shift_type})`).join(', ')
                 : null;
             row.assignments = assignments;
+            if (row.worker_id === 38) {
+    console.log('WORKER 38 FINAL RESPONSE:', {
+        assigned_site_id: row.assigned_site_id,
+        assigned_site_name: row.assigned_site_name,
+        assignments: row.assignments
+    });
+}
             delete row.assignments_json;
 
             if (row.personal_photo && !row.personal_photo.startsWith('http')) {

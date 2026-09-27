@@ -109,10 +109,9 @@ async function verifyWorkerAssignedToSite(workerId, siteId, shiftType, recordDat
     );
     return rows.length > 0;
 }
-
-async function verifySiteAction(req, siteId) {
+async function verifySiteAction(req, siteId, shiftType = 'Day') {
     if (req.user.role === 'Admin') return true;
-    return verifySupervisorSite(req.user.user_id, siteId);
+    return verifySupervisorSite(req.user.user_id, siteId, shiftType);
 }
 
 exports.getSiteWorkers = async (req, res) => {

@@ -1100,19 +1100,24 @@ function shapeArabicAware(str) {
          AND status = 'Approved'`,
       [batch.start_date, batch.end_date]
     );
-    const dailyMap = new Map();
-    for (const a of attRows) {
-      const key = `${a.worker_id}|${a.site_id}|${a.record_date}`;
-     const dailyMap = new Map();
+const dailyMap = new Map();
+
 for (const a of attRows) {
-    const key = `${a.worker_id}|${a.site_id}|${a.record_date}`;
-    const prior = dailyMap.get(key) || { reg: 0, ot: 0 };
-    dailyMap.set(key, {
-        reg: prior.reg + Number(a.total_working_hours || 0),
-        ot: prior.ot + Number(a.overtime_hours || 0),
-    });
+  const key = `${a.worker_id}|${a.site_id}|${a.record_date}`;
+  const prior = dailyMap.get(key) || { reg: 0, ot: 0 };
+
+  dailyMap.set(key, {
+    reg: prior.reg + Number(a.total_working_hours || 0),
+    ot: prior.ot + Number(a.overtime_hours || 0),
+  });
 }
-    }
+
+function getDaily(workerId, siteId, date) {
+  return dailyMap.get(`${workerId}|${siteId}|${date}`) || {
+    reg: 0,
+    ot: 0,
+  };
+}
     function getDaily(workerId, siteId, date) {
       return dailyMap.get(`${workerId}|${siteId}|${date}`) || { reg: 0, ot: 0 };
     }

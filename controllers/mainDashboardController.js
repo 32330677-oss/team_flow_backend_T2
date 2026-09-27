@@ -63,9 +63,11 @@ async function getOverview(req, res) {
        FROM attendance a
        JOIN workers w ON w.worker_id = a.worker_id AND w.status = 'Active'
        JOIN sites s ON s.site_id = a.site_id AND s.site_status = 'Active'
-       JOIN workersiteassignments wsa
-         ON wsa.worker_id = a.worker_id AND wsa.site_id = a.site_id
-        AND wsa.assigned_date <= a.record_date
+JOIN workersiteassignments wsa
+  ON wsa.worker_id = a.worker_id
+ AND wsa.site_id = a.site_id
+ AND wsa.shift_type = a.shift_type
+ AND wsa.assigned_date <= a.record_date
         AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= a.record_date)
        LEFT JOIN (
          SELECT DISTINCT a2.attendance_id
@@ -92,10 +94,12 @@ async function getOverview(req, res) {
        JOIN attendance a ON a.attendance_id = alp.attendance_id
        JOIN workers w ON w.worker_id = a.worker_id AND w.status = 'Active'
        JOIN sites s ON s.site_id = a.site_id AND s.site_status = 'Active'
-       JOIN workersiteassignments wsa
-         ON wsa.worker_id = a.worker_id AND wsa.site_id = a.site_id
-        AND wsa.assigned_date <= a.record_date
-        AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= a.record_date)
+JOIN workersiteassignments wsa
+  ON wsa.worker_id = a.worker_id
+ AND wsa.site_id = a.site_id
+ AND wsa.shift_type = a.shift_type
+ AND wsa.assigned_date <= a.record_date
+ AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= a.record_date)
        WHERE alp.leave_end_time IS NULL AND a.record_date = ? AND a.status <> 'Rejected'
        ORDER BY alp.leave_start_time DESC`,
       [today]
@@ -116,9 +120,12 @@ async function getOverview(req, res) {
          ON wsa.site_id = s.site_id AND wsa.assigned_date <= ?
         AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ?)
        JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
-       LEFT JOIN attendance a
-         ON a.worker_id = wsa.worker_id AND a.site_id = wsa.site_id
-        AND a.record_date = ? AND a.status <> 'Rejected'
+LEFT JOIN attendance a
+  ON a.worker_id = wsa.worker_id
+ AND a.site_id = wsa.site_id
+ AND a.shift_type = wsa.shift_type
+ AND a.record_date = ?
+ AND a.status <> 'Rejected'
        LEFT JOIN attendanceleaveperiods alp
          ON alp.attendance_id = a.attendance_id AND alp.leave_end_time IS NULL
        WHERE s.site_status = 'Active'
@@ -143,9 +150,12 @@ async function getOverview(req, res) {
         AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ds.dt)
        LEFT JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
        LEFT JOIN sites s ON s.site_id = wsa.site_id AND s.site_status = 'Active'
-       LEFT JOIN attendance a
-         ON a.worker_id = wsa.worker_id AND a.site_id = wsa.site_id
-        AND a.record_date = ds.dt AND a.status <> 'Rejected'
+LEFT JOIN attendance a
+  ON a.worker_id = wsa.worker_id
+ AND a.site_id = wsa.site_id
+ AND a.shift_type = wsa.shift_type
+ AND a.record_date = ds.dt
+ AND a.status <> 'Rejected'
        GROUP BY ds.dt ORDER BY ds.dt`,
       [start_date, end_date]
     );
@@ -165,9 +175,12 @@ async function getOverview(req, res) {
         AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ds.dt)
        LEFT JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
        LEFT JOIN sites s ON s.site_id = wsa.site_id AND s.site_status = 'Active'
-       LEFT JOIN attendance a
-         ON a.worker_id = wsa.worker_id AND a.site_id = wsa.site_id
-        AND a.record_date = ds.dt AND a.status <> 'Rejected'
+LEFT JOIN attendance a
+  ON a.worker_id = wsa.worker_id
+ AND a.site_id = wsa.site_id
+ AND a.shift_type = wsa.shift_type
+ AND a.record_date = ds.dt
+ AND a.status <> 'Rejected'
        GROUP BY ds.dt ORDER BY ds.dt`,
       [start_date, end_date]
     );
