@@ -1,6 +1,7 @@
 const db = require('../config/db');
 const biometricDeviceUserService = require('./biometricDeviceUserService');
-
+const attendanceService = require('./attendanceService');                       // NEW (Worker only)
+const { calculateStaffShiftHours } = require('./staffAttendanceService');  
 const NIGHT_START_MINUTES = 17 * 60; // 17:00
 const NIGHT_END_MINUTES = 4 * 60;    // 04:00 next day
 
@@ -425,12 +426,6 @@ async function applyWorkerIn(
     };
 }
 
-/**
- * Apply an OUT punch to Worker attendance.
- *
- * We only close an existing Draft record.
- * We do not manufacture an attendance record from an OUT punch.
- */
 async function applyWorkerOut(
     context,
     punchedAt,
@@ -503,6 +498,12 @@ async function applyWorkerOut(
              updated_at = CURRENT_TIMESTAMP
          WHERE attendance_id = ?`,
         [punchedAt, existing.attendance_id]
+    );
+
+    // Calculate Worker hours only after a valid checkout is saved.
+    await attendanceService.calculateWorkingHours(
+        existing.attendance_id,
+        executor
     );
 
     return {
@@ -819,24 +820,45 @@ async function applyStaffOut(
         };
     }
 
-    /*
-     * Only save the checkout here.
-     *
-     * We intentionally do NOT calculate:
-     * - regular_hours
-     * - overtime_hours
-     * - lunch_deducted_hours
-     * - Friday calculations
-     *
-     * Those belong to the existing Staff attendance/payroll logic.
-     */
+ 
+        // Standard hours: same rule as the supervisor flow
+    // (row snapshot first, else the staff profile, else 8h).
+    const [[staffRow]] = await executor.execute(
+        `SELECT standard_daily_hours FROM staff_members WHERE staff_id = ?`,
+        [context.staffId]
+    );
+    const profileHours = Number(staffRow?.standard_daily_hours) > 0
+        ? Number(staffRow.standard_daily_hours)
+        : 8;
+    const snapshotMinutes = Number(existing.standard_minutes_snapshot) > 0
+        ? Number(existing.standard_minutes_snapshot)
+        : Math.round(profileHours * 60);
+
+    // Existing Staff calculation (no formula changes, no Worker code).
+    const shift = calculateStaffShiftHours({
+        checkInRaw: existing.check_in_time,
+        checkOutRaw: punchedAt,
+        lunchStartRaw: existing.lunch_start_time,
+        lunchEndRaw: existing.lunch_end_time,
+        recordDate: context.recordDate,
+        standardDailyHours: snapshotMinutes / 60,
+    });
+
     await executor.execute(
         `UPDATE staff_attendance
          SET check_out_time = ?,
+             regular_hours = ?,
+             overtime_hours = ?,
+             lunch_deducted_hours = ?,
+             standard_minutes_snapshot = COALESCE(standard_minutes_snapshot, ?),
              updated_at = CURRENT_TIMESTAMP
          WHERE staff_attendance_id = ?`,
         [
             punchedAt,
+            shift.regularHours.toFixed(2),
+            shift.overtimeHours.toFixed(2),
+            shift.lunchHours.toFixed(2),
+            snapshotMinutes,
             existing.staff_attendance_id,
         ]
     );
