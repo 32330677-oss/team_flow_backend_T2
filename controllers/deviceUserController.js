@@ -1,5 +1,5 @@
 const biometricDeviceUserService = require('../services/biometricDeviceUserService');
-
+const db = require('../config/db');
 function getUserId(req) {
   const userId = Number(req.user?.user_id ?? req.user?.id);
 
@@ -126,11 +126,69 @@ async function voidDeviceUserMapping(req, res) {
     return sendError(res, error);
   }
 }
+async function listAvailableEntities(req, res) {
+  try {
+    const entityType = String(req.query.entity_type || '').trim();
 
+    if (!['Worker', 'Staff'].includes(entityType)) {
+      return res.status(400).json({
+        success: false,
+        message: 'entity_type must be Worker or Staff.',
+      });
+    }
+
+    let rows;
+
+    if (entityType === 'Worker') {
+      [rows] = await db.execute(
+        `SELECT
+            w.worker_id,
+            w.worker_unique_id,
+            w.full_name
+         FROM workers w
+         WHERE w.status = 'Active'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM attendance_device_users du
+             WHERE du.worker_id = w.worker_id
+               AND du.entity_type = 'Worker'
+               AND du.active = 1
+           )
+         ORDER BY w.full_name`
+      );
+    } else {
+      [rows] = await require('../config/db').execute(
+        `SELECT
+            sm.staff_id,
+            sm.staff_unique_id,
+            sm.full_name,
+            sm.position
+         FROM staff_members sm
+         WHERE sm.status = 'Active'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM attendance_device_users du
+             WHERE du.staff_id = sm.staff_id
+               AND du.entity_type = 'Staff'
+               AND du.active = 1
+           )
+         ORDER BY sm.full_name`
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: rows,
+    });
+  } catch (error) {
+    return sendError(res, error);
+  }
+}
 module.exports = {
   listDeviceUserMappings,
   resolveDeviceUser,
   createDeviceUserMapping,
   endDeviceUserMapping,
   voidDeviceUserMapping,
+  listAvailableEntities,
 };

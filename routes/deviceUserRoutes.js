@@ -10,6 +10,7 @@ router.use(authMiddleware);
 router.use(restrictTo('Admin'));
 
 router.get('/', controller.listDeviceUserMappings);
+router.get('/available', controller.listAvailableEntities);
 router.get('/resolve', controller.resolveDeviceUser);
 
 router.post('/', controller.createDeviceUserMapping);
