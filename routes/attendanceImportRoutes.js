@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const controller = require('../controllers/attendanceImportController');
+const adminImport = require('../controllers/biometricImportAdminController');
 const connectorAuth = require('../middleware/connectorAuth');
 const authMiddleware = require('../middleware/authMiddleware');
 const restrictTo = require('../middleware/roleMiddleware');
@@ -12,5 +13,11 @@ router.post('/batches/:batchId/complete', connectorAuth, controller.completeBatc
 router.get('/batches/:batchId', connectorAuth, controller.getBatch);
 router.post('/punches', connectorAuth, controller.addPunches);
 router.get('/punches/unmapped', authMiddleware, restrictTo('Admin'), controller.getUnmappedDeviceIds);
+
+// Admin (JWT) control layer used by the ASIK app
+router.get('/import-batches', authMiddleware, restrictTo('Admin'), adminImport.listBatches);
+router.get('/import-batches/:batchId', authMiddleware, restrictTo('Admin'), adminImport.getBatchDetail);
+router.post('/import-file', authMiddleware, restrictTo('Admin'), adminImport.uploadMiddleware, adminImport.uploadAndRun);
+router.post('/import-run', authMiddleware, restrictTo('Admin'), adminImport.runOnly);
 
 module.exports = router;
