@@ -341,6 +341,7 @@ async function getStaffAttendance(
 async function applyWorkerIn(
     context,
     punchedAt,
+    recordedByUserId,
     executor
 ) {
     const existing = await getWorkerAttendance(
@@ -413,7 +414,7 @@ async function applyWorkerIn(
             context.siteId,
             context.recordDate,
             punchedAt,
-            1,
+            recordedByUserId,
             context.shiftType,
         ]
     );
@@ -554,6 +555,7 @@ if (context.entityType === 'Worker') {
         result = await applyWorkerIn(
             context,
             punch.punched_at,
+            context.recordedByUserId,   // new argument
             connection
         );
     } else if (punch.punch_type === 'OUT') {

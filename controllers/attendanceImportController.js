@@ -79,7 +79,6 @@ exports.createBatch = async (req, res) => {
   }
 };
 
-// POST /api/attendance/punches
 exports.addPunches = async (req, res) => {
   const batchId = Number(req.body?.batchId);
   const punches = req.body?.punches;
@@ -87,6 +86,8 @@ exports.addPunches = async (req, res) => {
       punches.length === 0 || punches.length > MAX_PUNCHES_PER_REQUEST) {
     return res.status(400).json({ status: 'error', message: `batchId and 1-${MAX_PUNCHES_PER_REQUEST} punches are required.` });
   }
+
+  let connection = null;
   try {
     const [batches] = await db.execute('SELECT id, status FROM attendance_import_batches WHERE id = ?', [batchId]);
     if (!batches.length) return res.status(404).json({ status: 'error', message: 'Batch not found.' });
@@ -94,21 +95,37 @@ exports.addPunches = async (req, res) => {
       return res.status(409).json({ status: 'error', message: 'This batch is already completed.' });
     }
 
+    connection = await db.getConnection();
+
     let inserted = 0, duplicates = 0;
     const errors = [];
     for (let i = 0; i < punches.length; i += 1) {
       const { value, error } = validatePunch(punches[i]);
       if (error) { errors.push({ index: i, reason: error }); continue; }
+
+      let rawInserted = false;
       try {
-        await db.execute(
+        await connection.beginTransaction();
+
+        const [punchResult] = await connection.execute(
           `INSERT INTO attendance_punches
              (batch_id, device_employee_id, punched_at, raw_punch_code, punch_type, raw_line, line_number, dedupe_key)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
           [batchId, value.deviceEmployeeId, value.punchedAt, value.rawPunchCode,
            value.punchType, value.rawLine, value.lineNumber, value.dedupeKey]);
+        rawInserted = true;
+
+        await connection.execute(
+          `INSERT INTO attendance_punch_processing (punch_id, processing_status)
+           VALUES (?, 'Pending')`,
+          [punchResult.insertId]);
+
+        await connection.commit();
         inserted += 1;
       } catch (e) {
-        if (e.code === 'ER_DUP_ENTRY') duplicates += 1; // UNIQUE(dedupe_key) is the real guard
+        try { await connection.rollback(); } catch (_) {}
+        // UNIQUE(dedupe_key) on the RAW insert is the real duplicate guard.
+        if (e.code === 'ER_DUP_ENTRY' && !rawInserted) duplicates += 1;
         else throw e;
       }
     }
@@ -116,6 +133,8 @@ exports.addPunches = async (req, res) => {
   } catch (error) {
     console.error('ADD PUNCHES ERROR:', error);
     return res.status(500).json({ status: 'error', message: 'Failed to store punches.' });
+  } finally {
+    if (connection) connection.release();
   }
 };
 
