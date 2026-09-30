@@ -18,6 +18,7 @@ const staffAttendanceRoutes = require('./routes/staffAttendanceRoutes');
 const staffPayrollRoutes = require('./routes/StaffPayrollRoutes');
 const staffOvertimeRoutes = require('./routes/staffOvertimeRoutes');
 const mainDashboardRoutes = require('./routes/mainDashboardRoutes');
+const biometricAttendanceAdminRoutes = require('./routes/biometricAttendanceAdminRoutes');
 
 require('dotenv').config();
 if (!process.env.JWT_SECRET) {
@@ -32,7 +33,7 @@ const app = express();
 
 // Middlewares
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '2mb' }));
 app.set('trust proxy', 1); // أو true
 // ربط المسارات بالسيرفر
 app.use('/api/auth', authRoutes);
@@ -50,6 +51,7 @@ app.use('/api/admin/attendance', adminAttendanceRoutes);
 app.use('/api/admin/payroll', adminPayrollRoutes);
 app.use('/api/transfers', transferRoutes);
 app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use('/api/biometric/attendance', biometricAttendanceAdminRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/staff', staffRoutes);
 app.use('/api/staff-attendance', staffAttendanceRoutes);

@@ -6,6 +6,7 @@ exports.getPendingRecords = async (req, res) => {
     try {
         const [rows] = await db.execute(
             `SELECT a.attendance_id, a.worker_id, a.site_id, a.shift_type,
+                    a.source,
                     a.check_in_time, a.check_out_time,
                     a.total_working_hours, a.overtime_hours,
                     a.management_leave_hours, a.status, a.attendance_status,
@@ -68,7 +69,9 @@ exports.reviewRecord = async (req, res) => {
             if (oldRecord.status !== 'Submitted') {
                  throw new Error('Record cannot be reviewed as it is not in pending status.');
             }
-
+            if (status === 'Rejected' && oldRecord.source === 'Biometric') {
+                throw new Error('Biometric records cannot be rejected. Correct the times from the Biometric Processing page, then approve.');
+            }
             await connection.execute(
                 `UPDATE attendance 
                  SET status = ?, admin_rejection_notes = ?, approved_by_user_id = ?, approval_date = NOW() 

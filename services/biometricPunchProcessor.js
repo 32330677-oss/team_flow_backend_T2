@@ -8,18 +8,23 @@ const {
 const LOCK_KEY = 'biometric_punch_processing';
 const COMPLETED_BATCH_STATUSES = ['Completed', 'CompletedWithErrors'];
 
-const SKIPPED_STATUSES = new Set(['unmapped', 'no_assignment', 'outside_shift_window']);
+const SKIPPED_STATUSES = new Set([
+  'unmapped', 'no_assignment', 'future_punch', 'punch_too_old',
+  'staff_inactive', 'not_employed_on_date', 'no_supervisor_assignment',
+]);
 const SKIPPED_ACTIONS = new Set(['no_open_attendance', 'no_check_in']);
 const PROCESSED_ACTIONS = new Set([
-  'created',
-  'checked_in_existing',
-  'already_checked_in',
-  'checked_out',
-  'already_checked_out',
-  'ignored_locked',
-  'ignored_rejected',
+  'created', 'checked_in_existing', 'checked_in_updated_earlier',
+  'already_checked_in', 'checked_out', 'checked_out_updated_later',
+  'already_checked_out', 'ignored_locked', 'ignored_rejected',
+  'ignored_manual',   // NEW
 ]);
-const FAILED_ACTIONS = new Set(['invalid_checkout_time']);
+const FAILED_ACTIONS = new Set(['invalid_checkout_time', 'open_break', 'conflict_review']);
+const FAILED_MESSAGES = {
+  invalid_checkout_time: 'Check-out time is not after the existing check-in time. Requires review.',
+  open_break: 'Worker has an open break. End the break, then retry.',
+  conflict_review: 'Another attendance record conflicts with this punch. Requires review.',
+};
 
 function createError(message, statusCode) {
   const error = new Error(message);
@@ -54,12 +59,8 @@ function classifyOutcome(outcome) {
 
   const action = String(outcome.result?.action || '');
 
-  if (FAILED_ACTIONS.has(action)) {
-    return {
-      status: 'Failed',
-      result: action,
-      error: 'Check-out time is not after the existing check-in time. Requires review.',
-    };
+   if (FAILED_ACTIONS.has(action)) {
+    return { status: 'Failed', result: action, error: FAILED_MESSAGES[action] };
   }
   if (SKIPPED_ACTIONS.has(action)) {
     return { status: 'Skipped', result: action, error: null };
@@ -92,9 +93,9 @@ async function processPendingPunches({
     throw createError('limit must be an integer between 1 and 2000.', 400);
   }
 
-  const statuses = ['Pending'];
-  if (retrySkipped) statuses.push('Skipped');
-  if (retryFailed) statuses.push('Failed');
+const statuses = ['Pending'];
+if (retrySkipped) statuses.push('Skipped');
+if (retryFailed === true) statuses.push('Failed');
 
   const connection = await db.getConnection();
   let lockAcquired = false;
@@ -109,7 +110,6 @@ async function processPendingPunches({
     const statusPlaceholders = statuses.map(() => '?').join(',');
     const batchPlaceholders = COMPLETED_BATCH_STATUSES.map(() => '?').join(',');
 
-    // limit is a validated integer, so inlining it is safe
     const [rows] = await connection.execute(
       `SELECT p.id, p.device_employee_id, p.punched_at, p.punch_type
        FROM attendance_punch_processing pr
@@ -117,10 +117,16 @@ async function processPendingPunches({
        JOIN attendance_import_batches b ON b.id = p.batch_id
        WHERE pr.processing_status IN (${statusPlaceholders})
          AND b.status IN (${batchPlaceholders})
-       ORDER BY p.punched_at ASC, p.id ASC
+         AND NOT (pr.processing_status = 'Skipped' AND pr.processing_result = 'punch_too_old')
+       ORDER BY FIELD(pr.processing_status, 'Pending', 'Skipped', 'Failed') ASC,
+                p.punched_at ASC, p.id ASC
        LIMIT ${limit}`,
       [...statuses, ...COMPLETED_BATCH_STATUSES]
     );
+
+    // Priority decides WHICH punches are taken; inside the run they go chronologically (IN before OUT).
+    rows.sort((a, b) =>
+      String(a.punched_at).localeCompare(String(b.punched_at)) || Number(a.id) - Number(b.id));
 
     const summary = {
       selected: rows.length,

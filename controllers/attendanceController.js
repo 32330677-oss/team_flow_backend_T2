@@ -1032,44 +1032,7 @@ exports.saveLunchBulk = async (req, res) => {
     }
 };
 
-// ==================== Submit Day ====================
-// يغطّي الحالتين المطلوبتين:
-// 1) عامل ما اخد غدا وشغّال عالساعة -> ما بينضاف له سجل إجازة "Lunch"، فما بينخصم
-//    وقت من ساعات شغله. بس بيطلب سبب تأكيد لأن الشيفت طويل و/أو بيتقاطع مع وقت غدا الموقع.
-// 2) عامل طلّع Check-out قبل ما يبلش وقت الغدا -> شرط التقاطع ما بيتحقق أصلاً،
-//    فما بينطلب منه تأكيد وما بينخصم منه شي.
-// ==================== Submit Day ====================
 
-/*
- * Lunch policy:
- *
- * If a completed shift has no Lunch record:
- *
- * worked_through_lunch = true
- *   -> Do NOT create Lunch
- *   -> Lunch time remains working time
- *   -> If total exceeds standard hours, the excess becomes overtime
- *
- * worked_through_lunch = false
- *   -> Create a Lunch leave using the site's configured lunch period
- *   -> Lunch time is deducted from working hours
- *
- * Frontend payload:
- *
- * lunch_decisions: [
- *   {
- *     attendance_id: 123,
- *     worked_through_lunch: true,
- *     reason: "Worked during lunch"
- *   },
- *   {
- *     attendance_id: 124,
- *     worked_through_lunch: false
- *   }
- * ]
- */
-
-// ------------------------------------------------------------
 exports.submitDay = async (req, res) => {
     const {
         siteId,
@@ -1119,16 +1082,15 @@ exports.submitDay = async (req, res) => {
         await connection.beginTransaction();
         transactionStarted = true;
 
-        // 1) Open shifts
-        const [openShifts] = await connection.execute(
+          const [openShifts] = await connection.execute(
             `SELECT a.attendance_id, w.full_name
              FROM attendance a
              JOIN workers w ON w.worker_id = a.worker_id
              WHERE a.site_id = ? AND a.shift_type = ?
                AND (a.record_date = ? OR a.record_date = DATE_SUB(?, INTERVAL 1 DAY))
                AND a.status = 'Draft'
-               AND a.check_in_time IS NOT NULL
-               AND a.check_out_time IS NULL`,
+               AND a.attendance_status = 'Present'
+               AND (a.check_in_time IS NULL OR a.check_out_time IS NULL)`,
             [siteId, shiftType, record_date, record_date]
         );
         if (openShifts.length > 0) {
@@ -1362,7 +1324,9 @@ exports.submitDay = async (req, res) => {
              WHERE site_id = ? AND shift_type = ?
                AND (record_date = ? OR (record_date = DATE_SUB(?, INTERVAL 1 DAY)
                     AND check_out_time IS NOT NULL AND DATE(check_out_time) > record_date))
-               AND status = 'Draft'`,
+                              AND status = 'Draft'
+               AND (attendance_status <> 'Present'
+                    OR (check_in_time IS NOT NULL AND check_out_time IS NOT NULL))`,
             [siteId, shiftType, record_date, record_date]
         );
 

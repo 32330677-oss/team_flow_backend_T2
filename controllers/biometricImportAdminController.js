@@ -214,7 +214,13 @@ exports.getBatchDetail = async (req, res) => {
     if (typeof errors === 'string') {
       try { errors = JSON.parse(errors); } catch (_) { errors = []; }
     }
-
+if (
+  errors &&
+  !Array.isArray(errors) &&
+  Array.isArray(errors.parse_errors)
+) {
+  errors = errors.parse_errors;
+}
     return res.status(200).json({
       status: 'success',
       data: {

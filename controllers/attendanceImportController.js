@@ -69,8 +69,19 @@ exports.createBatch = async (req, res) => {
         batch = await find(); // concurrent creation
       }
     }
+      if (batch.status === 'Pending') {
+      await db.execute(
+        `UPDATE attendance_import_batches
+         SET error_rows = 0
+         WHERE id = ? AND status = 'Pending'`,
+        [batch.id]
+      );
+    }
+
     return res.status(200).json({
-      status: 'success', batchId: batch.id, batchStatus: batch.status,
+      status: 'success',
+      batchId: batch.id,
+      batchStatus: batch.status,
       alreadyImported: ['Completed', 'CompletedWithErrors'].includes(batch.status),
     });
   } catch (error) {
@@ -129,6 +140,11 @@ exports.addPunches = async (req, res) => {
         else throw e;
       }
     }
+        if (errors.length > 0) {
+      await db.execute(
+        'UPDATE attendance_import_batches SET error_rows = error_rows + ? WHERE id = ?',
+        [errors.length, batchId]);
+    }
     return res.status(200).json({ status: 'success', inserted, duplicates, errors: errors.length, errorDetails: errors.slice(0, 20) });
   } catch (error) {
     console.error('ADD PUNCHES ERROR:', error);
@@ -138,8 +154,6 @@ exports.addPunches = async (req, res) => {
   }
 };
 
-// POST /api/attendance/import-batches/:batchId/complete
-// body: { totalRows, validRows, errorRows, errors: [{lineNumber, reason, rawLine}] }
 exports.completeBatch = async (req, res) => {
   const batchId = Number(req.params.batchId);
   const toInt = (v) => (Number.isInteger(Number(v)) && Number(v) >= 0 ? Number(v) : null);
@@ -152,27 +166,38 @@ exports.completeBatch = async (req, res) => {
   const errorDetails = Array.isArray(req.body?.errors) ? req.body.errors.slice(0, 50) : [];
 
   try {
-    const [[found]] = await db.execute('SELECT id FROM attendance_import_batches WHERE id = ?', [batchId]).then(([r]) => [r]);
-    if (!found) return res.status(404).json({ status: 'error', message: 'Batch not found.' });
+    const [found] = await db.execute(
+      'SELECT id, status, error_rows FROM attendance_import_batches WHERE id = ?', [batchId]);
+    if (!found.length) return res.status(404).json({ status: 'error', message: 'Batch not found.' });
+    const batch = found[0];
 
-    const [[cnt]] = await db.execute('SELECT COUNT(*) AS c FROM attendance_punches WHERE batch_id = ?', [batchId]).then(([r]) => [r]);
+    // Idempotent: a completed batch is never recomputed.
+    if (['Completed', 'CompletedWithErrors', 'Failed'].includes(batch.status)) {
+      return res.status(200).json({ status: 'success', batchStatus: batch.status, alreadyCompleted: true });
+    }
+
+    const serverRejected = Number(batch.error_rows || 0);   // rejected by validatePunch during upload
+    const [[cnt]] = await db.execute(
+      'SELECT COUNT(*) AS c FROM attendance_punches WHERE batch_id = ?', [batchId]).then(([r]) => [r]);
     const inserted = Number(cnt.c);
-    const duplicates = Math.max(0, validRows - inserted);
-    const status = validRows === 0 ? 'Failed' : (errorRows > 0 ? 'CompletedWithErrors' : 'Completed');
+    const duplicates = Math.max(0, validRows - serverRejected - inserted);
+    const totalErrors = errorRows + serverRejected;
+    const status = validRows === 0 ? 'Failed' : (totalErrors > 0 ? 'CompletedWithErrors' : 'Completed');
 
     await db.execute(
       `UPDATE attendance_import_batches
        SET status = ?, total_rows = ?, inserted_rows = ?, duplicate_rows = ?, error_rows = ?,
            error_details = ?, imported_at = NOW()
        WHERE id = ?`,
-      [status, totalRows, inserted, duplicates, errorRows, JSON.stringify(errorDetails), batchId]);
+      [status, totalRows, inserted, duplicates, totalErrors,
+        JSON.stringify({ parse_errors: errorDetails, server_rejected: serverRejected }), batchId]);
 
     await db.execute(
       `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
        VALUES ('attendance_import_batches', ?, 'BIOMETRIC_IMPORT_COMPLETED', NULL, NULL, ?)`,
-      [batchId, JSON.stringify({ status, totalRows, inserted, duplicates, errorRows })]);
+      [batchId, JSON.stringify({ status, totalRows, inserted, duplicates, totalErrors })]);
 
-    return res.status(200).json({ status: 'success', batchStatus: status, total: totalRows, inserted, duplicates, errors: errorRows });
+    return res.status(200).json({ status: 'success', batchStatus: status, total: totalRows, inserted, duplicates, errors: totalErrors });
   } catch (error) {
     console.error('COMPLETE IMPORT BATCH ERROR:', error);
     return res.status(500).json({ status: 'error', message: 'Failed to complete import batch.' });
@@ -201,7 +226,6 @@ exports.getBatch = async (req, res) => {
   }
 };
 
-// GET /api/attendance/punches/unmapped   (Admin JWT) — device IDs with no mapping
 exports.getUnmappedDeviceIds = async (req, res) => {
   try {
     const [rows] = await db.execute(
@@ -213,6 +237,10 @@ exports.getUnmappedDeviceIds = async (req, res) => {
         AND DATE(p.punched_at) >= u.effective_from
         AND (u.effective_to IS NULL OR DATE(p.punched_at) <= u.effective_to)
        WHERE u.id IS NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM attendance_device_users o
+           WHERE o.device_employee_id = p.device_employee_id
+             AND o.active = 1 AND o.effective_to IS NULL)
        GROUP BY p.device_employee_id
        ORDER BY last_punch DESC`);
     return res.status(200).json({ status: 'success', data: rows });

@@ -1,878 +1,429 @@
 const db = require('../config/db');
 const biometricDeviceUserService = require('./biometricDeviceUserService');
-const attendanceService = require('./attendanceService');                       // NEW (Worker only)
-const { calculateStaffShiftHours } = require('./staffAttendanceService');  
-const NIGHT_START_MINUTES = 17 * 60; // 17:00
-const NIGHT_END_MINUTES = 4 * 60;    // 04:00 next day
+const attendanceService = require('./attendanceService');
+const { calculateStaffShiftHours } = require('./staffAttendanceService');
+const { getActiveSpansOverlapping } = require('./staffEmploymentService');
+
+// Business rules (override through .env)
+const MAX_SHIFT_HOURS = Math.min(23, Math.max(1, Number(process.env.BIOMETRIC_MAX_SHIFT_HOURS) || 16));
+const MAX_PUNCH_AGE_DAYS = Math.max(1, Number(process.env.BIOMETRIC_MAX_PUNCH_AGE_DAYS) || 30);
+
+const TABLES = {
+  Worker: { table: 'attendance', pk: 'attendance_id', owner: 'worker_id' },
+  Staff: { table: 'staff_attendance', pk: 'staff_attendance_id', owner: 'staff_id' },
+};
 
 function createServiceError(message, statusCode = 400) {
-    const error = new Error(message);
-    error.statusCode = statusCode;
-    return error;
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
 }
 
 function normalizeShift(value) {
-    return ['Day', 'Night'].includes(value) ? value : 'Day';
+  return ['Day', 'Night'].includes(value) ? value : 'Day';
 }
 
-function toDateOnly(value) {
-    if (!value) return null;
+// ---------- wall-clock helpers (no timezone conversion, same as the rest of the codebase) ----------
+const pad = (n) => String(n).padStart(2, '0');
 
-    if (value instanceof Date) {
-        const year = value.getFullYear();
-        const month = String(value.getMonth() + 1).padStart(2, '0');
-        const day = String(value.getDate()).padStart(2, '0');
-        return `${year}-${month}-${day}`;
-    }
-
-    return String(value).slice(0, 10);
+function toWall(value) {
+  return String(value).replace('T', ' ').slice(0, 19);
 }
 
-function getMinutesFromDateTime(value) {
-    const text = value instanceof Date
-        ? `${String(value.getHours()).padStart(2, '0')}:${String(value.getMinutes()).padStart(2, '0')}`
-        : String(value).slice(11, 16);
-
-    const [hours, minutes] = text.split(':').map(Number);
-
-    if (!Number.isInteger(hours) || !Number.isInteger(minutes)) {
-        return null;
-    }
-
-    return hours * 60 + minutes;
+function wallToMs(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2})$/.exec(s);
+  if (!m) throw createServiceError('Invalid punch datetime.');
+  return Date.UTC(+m[1], m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
 }
 
-/**
- * Determines the Worker attendance record_date from the punch time.
- *
- * Day:
- *   record_date = calendar date of punch
- *
- * Night:
- *   17:00 -> 23:59 = same calendar date
- *   00:00 -> 04:00 = previous calendar date
- */
-function getWorkerRecordDate(punchedAt, shiftType) {
-    const date = toDateOnly(punchedAt);
-    const shift = normalizeShift(shiftType);
-
-    if (!date) {
-        throw createServiceError('Invalid punch datetime.');
-    }
-
-    if (shift !== 'Night') {
-        return date;
-    }
-
-    const minutes = getMinutesFromDateTime(punchedAt);
-
-    if (minutes === null) {
-        throw createServiceError('Invalid punch datetime.');
-    }
-
-    // 00:00 - 04:00 belongs to the previous Night shift.
-    if (minutes <= NIGHT_END_MINUTES) {
-        const d = new Date(`${date}T00:00:00`);
-
-        d.setDate(d.getDate() - 1);
-
-        return toDateOnly(d);
-    }
-
-    // 17:00 - 23:59 belongs to this day's Night shift.
-    if (minutes >= NIGHT_START_MINUTES) {
-        return date;
-    }
-
-    // 04:01 - 16:59 is outside the Night shift window.
-    return null;
+function msToWall(ms) {
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ` +
+    `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
 }
 
-/**
- * Find the Worker assignment that was active at the punch date.
- *
- * We intentionally return ambiguity instead of guessing if more than
- * one assignment is valid.
- */
-async function resolveWorkerAssignment(
-    workerId,
-    punchDate,
-    executor = db
-) {
-    const [rows] = await executor.execute(
-        `SELECT
-            wsa.worker_id,
-            wsa.site_id,
-            s.site_name,
-            wsa.shift_type,
-            wsa.assigned_date,
-            wsa.unassigned_date
-         FROM workersiteassignments wsa
-         JOIN workers w
-           ON w.worker_id = wsa.worker_id
-         JOIN sites s
-           ON s.site_id = wsa.site_id
-         WHERE wsa.worker_id = ?
-           AND wsa.assigned_date <= ?
-           AND (
-                wsa.unassigned_date IS NULL
-                OR wsa.unassigned_date > ?
-           )
-           AND w.status = 'Active'
-         ORDER BY
-            wsa.assigned_date DESC,
-            wsa.worker_id,
-            wsa.site_id,
-            wsa.shift_type`,
-        [workerId, punchDate, punchDate]
+const shiftWall = (s, hours) => msToWall(wallToMs(s) + hours * 3600000);
+const addDays = (dateStr, n) => msToWall(wallToMs(`${dateStr} 00:00:00`) + n * 86400000).slice(0, 10);
+
+function businessToday() {
+  const timeZone = process.env.APP_TIME_ZONE || 'Asia/Beirut';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+  }).formatToParts(new Date());
+  const v = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${v.year}-${v.month}-${v.day}`;
+}
+
+// Rule 10: no future punches, none older than MAX_PUNCH_AGE_DAYS.
+function checkPunchWindow(punchDate) {
+  const today = businessToday();
+  if (punchDate > today) return 'future_punch';
+  if (punchDate < addDays(today, -MAX_PUNCH_AGE_DAYS)) return 'punch_too_old';
+  return null;
+}
+
+function gate(rec) {
+  if (rec.status === 'Submitted' || rec.status === 'Approved') return 'ignored_locked';
+  if (rec.status === 'Rejected') return 'ignored_rejected';
+  return null;
+}
+
+// ---------- Worker assignment (same rule as manual verifyWorkerAssignedToSite) ----------
+async function resolveWorkerAssignment(workerId, punchDate, executor = db) {
+  const [rows] = await executor.execute(
+    `SELECT wsa.worker_id, wsa.site_id, wsa.shift_type
+     FROM workersiteassignments wsa
+     JOIN workers w ON w.worker_id = wsa.worker_id
+     WHERE wsa.worker_id = ?
+       AND wsa.assigned_date <= ?
+       AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
+       AND w.status = 'Active'
+     ORDER BY wsa.assigned_date DESC`,
+    [workerId, punchDate, punchDate]
+  );
+  if (rows.length === 0) return null;
+  if (rows.length > 1) {
+    throw createServiceError(
+      `Worker ${workerId} has multiple active site/shift assignments on ${punchDate}. Punch requires manual review.`,
+      409
     );
-
-    if (rows.length === 0) {
-        return null;
-    }
-
-    /*
-     * More than one valid assignment means we do not know where
-     * the biometric punch belongs.
-     */
-    if (rows.length > 1) {
-        throw createServiceError(
-            `Worker ${workerId} has multiple active site/shift assignments on ${punchDate}. Biometric punch cannot be assigned automatically.`,
-            409
-        );
-    }
-
-    return {
-        workerId: rows[0].worker_id,
-        siteId: rows[0].site_id,
-        siteName: rows[0].site_name,
-        shiftType: normalizeShift(rows[0].shift_type),
-        assignedDate: rows[0].assigned_date,
-        unassignedDate: rows[0].unassigned_date,
-    };
+  }
+  return { siteId: rows[0].site_id, shiftType: normalizeShift(rows[0].shift_type) };
 }
 
-/**
- * Resolve a biometric punch into its attendance context.
- *
- * This does NOT create/update attendance yet.
- */
-async function resolvePunchContext(punch, executor = db) {
-    if (!punch || !punch.device_employee_id || !punch.punched_at) {
-        throw createServiceError('device_employee_id and punched_at are required.');
-    }
+// scope = { siteId, shiftType } (Worker only). When given, only that site/shift is searched.
+// When absent (overnight OUT, or a worker with no assignment on the punch date), the candidate
+// records themselves decide the site/shift; ambiguity is never guessed.
+async function findSession(kind, ownerId, punchWall, direction, executor, scope = null) {
+  const t = TABLES[kind];
+  const lower = shiftWall(punchWall, -MAX_SHIFT_HOURS);
+  const upper = direction === 'OUT' ? punchWall : shiftWall(punchWall, MAX_SHIFT_HOURS);
 
-    const mapping =
-        await biometricDeviceUserService.resolveDeviceUser(
-            punch.device_employee_id,
-            punch.punched_at,
-            executor
-        );
+  const params = [ownerId, lower, upper];
+  let scopeSql = '';
+  if (kind === 'Worker' && scope) {
+    scopeSql = ' AND site_id = ? AND shift_type = ?';
+    params.push(scope.siteId, scope.shiftType);
+  }
 
-    if (!mapping) {
-        return {
-            status: 'unmapped',
-            context: null,
-        };
-    }
+  const [rows] = await executor.execute(
+    `SELECT * FROM ${t.table}
+     WHERE ${t.owner} = ? AND check_in_time IS NOT NULL
+       AND check_in_time BETWEEN ? AND ?${scopeSql}
+     ORDER BY ABS(TIMESTAMPDIFF(SECOND, check_in_time, ?)) ASC, check_in_time DESC
+     FOR UPDATE`,
+    [...params, punchWall]
+  );
 
-    if (mapping.entity_type === 'Staff') {
-        const recordDate = toDateOnly(punch.punched_at);
+  if (kind !== 'Worker' || scope || rows.length <= 1) return rows[0] || null;
 
-        return {
-            status: 'resolved',
-            context: {
-                entityType: 'Staff',
-                staffId: mapping.staff_id,
-                recordDate,
-            },
-        };
-    }
+  // Unscoped Worker lookup: candidates from different site/shift are never merged.
+  const keys = new Set(rows.map((r) => `${r.site_id}|${r.shift_type}`));
+  if (keys.size === 1) return rows[0];
 
-    if (mapping.entity_type !== 'Worker') {
-        throw createServiceError(
-            `Unsupported biometric entity type: ${mapping.entity_type}`,
-            409
-        );
-    }
+  const a = await resolveWorkerAssignment(ownerId, punchWall.slice(0, 10), executor);
+  const match = a ? rows.find((r) => r.site_id === a.siteId && r.shift_type === a.shiftType) : null;
+  if (match) return match;
 
-    const punchCalendarDate = toDateOnly(punch.punched_at);
-
-    const assignment = await resolveWorkerAssignment(
-        mapping.worker_id,
-        punchCalendarDate,
-        executor
-    );
-
-    if (!assignment) {
-        return {
-            status: 'no_assignment',
-            context: {
-                entityType: 'Worker',
-                workerId: mapping.worker_id,
-                punchCalendarDate,
-            },
-        };
-    }
-
-    const recordDate = getWorkerRecordDate(
-        punch.punched_at,
-        assignment.shiftType
-    );
-
-    if (!recordDate) {
-        return {
-            status: 'outside_shift_window',
-            context: {
-                entityType: 'Worker',
-                workerId: mapping.worker_id,
-                siteId: assignment.siteId,
-                siteName: assignment.siteName,
-                shiftType: assignment.shiftType,
-                punchCalendarDate,
-            },
-        };
-    }
-
-    /*
-     * For Night, the assignment must also be valid for the actual
-     * attendance record_date.
-     *
-     * This protects the 00:00-04:00 case.
-     */
-    const recordAssignment =
-        await resolveWorkerAssignment(
-            mapping.worker_id,
-            recordDate,
-            executor
-        );
-
-    if (!recordAssignment) {
-        return {
-            status: 'no_assignment',
-            context: {
-                entityType: 'Worker',
-                workerId: mapping.worker_id,
-                recordDate,
-            },
-        };
-    }
-
-    if (
-        recordAssignment.siteId !== assignment.siteId ||
-        recordAssignment.shiftType !== assignment.shiftType
-    ) {
-        throw createServiceError(
-            `Worker ${mapping.worker_id} assignment changed across the Night shift boundary. Biometric punch requires manual review.`,
-            409
-        );
-    }
-
-    return {
-        status: 'resolved',
-        context: {
-            entityType: 'Worker',
-            workerId: mapping.worker_id,
-            siteId: assignment.siteId,
-            siteName: assignment.siteName,
-            shiftType: assignment.shiftType,
-            recordDate,
-        },
-    };
+  throw createServiceError(
+    `Worker ${ownerId} punch matches sessions from more than one site/shift. Requires manual review.`,
+    409
+  );
 }
 
-/**
- * Find the Worker attendance record for the exact business key.
- */
-async function getWorkerAttendance(
-    workerId,
-    siteId,
-    shiftType,
-    recordDate,
-    executor = db,
-    forUpdate = false
-) {
-    const lock = forUpdate ? ' FOR UPDATE' : '';
+// ---------- Hours ----------
+async function staffHours(rec, inWall, outWall, executor) {
+  const [[sm]] = await executor.execute(
+    'SELECT standard_daily_hours FROM staff_members WHERE staff_id = ?',
+    [rec.staff_id]
+  );
+  const profileHours = Number(sm?.standard_daily_hours) > 0 ? Number(sm.standard_daily_hours) : 8;
+  const snapshotMinutes = Number(rec.standard_minutes_snapshot) > 0
+    ? Number(rec.standard_minutes_snapshot)
+    : Math.round(profileHours * 60);
 
-    const [rows] = await executor.execute(
-        `SELECT *
-         FROM attendance
-         WHERE worker_id = ?
-           AND site_id = ?
-           AND shift_type = ?
-           AND record_date = ?
-         LIMIT 1${lock}`,
-        [
-            workerId,
-            siteId,
-            shiftType,
-            recordDate,
-        ]
-    );
-
-    return rows.length ? rows[0] : null;
+  const shift = calculateStaffShiftHours({
+    checkInRaw: inWall,
+    checkOutRaw: outWall,
+    lunchStartRaw: rec.lunch_start_time,
+    lunchEndRaw: rec.lunch_end_time,
+    recordDate: inWall.slice(0, 10),
+    standardDailyHours: snapshotMinutes / 60,
+  });
+  return { shift, snapshotMinutes };
 }
 
-/**
- * Find Staff attendance for the business key.
- */
-async function getStaffAttendance(
-    staffId,
-    recordDate,
-    executor = db,
-    forUpdate = false
-) {
-    const lock = forUpdate ? ' FOR UPDATE' : '';
-
-    const [rows] = await executor.execute(
-        `SELECT *
-         FROM staff_attendance
-         WHERE staff_id = ?
-           AND record_date = ?
-         LIMIT 1${lock}`,
-        [staffId, recordDate]
-    );
-
-    return rows.length ? rows[0] : null;
+async function writeStaffHours(rec, inWall, outWall, executor) {
+  const { shift, snapshotMinutes } = await staffHours(rec, inWall, outWall, executor);
+  await executor.execute(
+    `UPDATE staff_attendance
+     SET regular_hours = ?, overtime_hours = ?, lunch_deducted_hours = ?,
+         standard_minutes_snapshot = COALESCE(standard_minutes_snapshot, ?),
+         updated_at = CURRENT_TIMESTAMP
+     WHERE staff_attendance_id = ?`,
+    [shift.regularHours.toFixed(2), shift.overtimeHours.toFixed(2), shift.lunchHours.toFixed(2),
+      snapshotMinutes, rec.staff_attendance_id]
+  );
 }
 
-/**
- * Apply an IN punch to Worker attendance.
- */
-async function applyWorkerIn(
-    context,
-    punchedAt,
-    recordedByUserId,
-    executor
-) {
-    const existing = await getWorkerAttendance(
-        context.workerId,
-        context.siteId,
-        context.shiftType,
-        context.recordDate,
-        executor,
-        true
-    );
+async function applyInToSession(kind, rec, punchWall, executor) {
+  const t = TABLES[kind];
+  const id = rec[t.pk];
 
-    if (existing) {
-        if (
-            existing.status === 'Submitted' ||
-            existing.status === 'Approved'
-        ) {
-            return {
-                action: 'ignored_locked',
-                attendanceId: existing.attendance_id,
-            };
-        }
+  // Biometric never touches a Manual record.
+  if (rec.source !== 'Biometric') return { action: 'ignored_manual', id };
 
-        if (existing.status === 'Rejected') {
-            return {
-                action: 'ignored_rejected',
-                attendanceId: existing.attendance_id,
-            };
-        }
+  const blocked = gate(rec);
+  if (blocked) return { action: blocked, id };
 
-        /*
-         * Existing Draft with a check-in:
-         * biometric duplicate/re-import should not overwrite it.
-         */
-        if (existing.check_in_time) {
-            return {
-                action: 'already_checked_in',
-                attendanceId: existing.attendance_id,
-            };
-        }
+  const curIn = toWall(rec.check_in_time);
+  if (punchWall >= curIn) return { action: 'already_checked_in', id };   // removed: || rec.source !== 'Biometric'
 
-        await executor.execute(
-            `UPDATE attendance
-             SET check_in_time = ?,
-                 attendance_status = 'Present',
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE attendance_id = ?`,
-            [punchedAt, existing.attendance_id]
-        );
+  const newDate = punchWall.slice(0, 10);
+  const oldDate = String(rec.record_date).slice(0, 10);
 
-        return {
-            action: 'checked_in_existing',
-            attendanceId: existing.attendance_id,
-        };
-    }
+  if (newDate !== oldDate) {
+    const [conflict] = kind === 'Worker'
+      ? await executor.execute(
+          `SELECT 1 FROM attendance
+           WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND record_date = ? AND attendance_id <> ? LIMIT 1`,
+          [rec.worker_id, rec.site_id, rec.shift_type, newDate, id])
+      : await executor.execute(
+          `SELECT 1 FROM staff_attendance
+           WHERE staff_id = ? AND record_date = ? AND staff_attendance_id <> ? LIMIT 1`,
+          [rec.staff_id, newDate, id]);
+    if (conflict.length) return { action: 'conflict_review', id };
+  }
 
-    const [result] = await executor.execute(
-        `INSERT INTO attendance (
-            worker_id,
-            site_id,
-            record_date,
-            check_in_time,
-            attendance_status,
-            recorded_by_user_id,
-            status,
-            shift_type
-         )
-         VALUES (?, ?, ?, ?, 'Present', ?, 'Draft', ?)`,
-        [
-            context.workerId,
-            context.siteId,
-            context.recordDate,
-            punchedAt,
-            recordedByUserId,
-            context.shiftType,
-        ]
-    );
+  await executor.execute(
+    `UPDATE ${t.table} SET check_in_time = ?, record_date = ?, updated_at = CURRENT_TIMESTAMP WHERE ${t.pk} = ?`,
+    [punchWall, newDate, id]
+  );
 
-    return {
-        action: 'created',
-        attendanceId: result.insertId,
-    };
+  if (rec.check_out_time) {
+    if (kind === 'Worker') await attendanceService.calculateWorkingHours(id, executor);
+    else await writeStaffHours(rec, punchWall, toWall(rec.check_out_time), executor);
+  }
+  return { action: 'checked_in_updated_earlier', id };
 }
 
-async function applyWorkerOut(
-    context,
-    punchedAt,
-    executor
-) {
-    const existing = await getWorkerAttendance(
-        context.workerId,
-        context.siteId,
-        context.shiftType,
-        context.recordDate,
-        executor,
-        true
+async function applyOutToSession(kind, rec, punchWall, executor) {
+  const t = TABLES[kind];
+  const id = rec[t.pk];
+
+  // Manual IN with no OUT must NOT be completed by a biometric OUT.
+  if (rec.source !== 'Biometric') return { action: 'ignored_manual', id };
+
+  const blocked = gate(rec);
+  if (blocked) return { action: blocked, id };
+
+  const inWall = toWall(rec.check_in_time);
+  if (punchWall <= inWall) return { action: 'invalid_checkout_time', id };
+
+  if (rec.check_out_time) {
+    const curOut = toWall(rec.check_out_time);
+    if (punchWall <= curOut) return { action: 'already_checked_out', id };   // removed: || rec.source !== 'Biometric'
+  }
+
+  if (kind === 'Worker') {
+    // Same rule as manual checkOut: no open break.
+    const [[openLeave]] = await executor.execute(
+      `SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_end_time IS NULL LIMIT 1`,
+      [id]
     );
-
-    if (!existing) {
-        return {
-            action: 'no_open_attendance',
-            attendanceId: null,
-        };
-    }
-
-    if (
-        existing.status === 'Submitted' ||
-        existing.status === 'Approved'
-    ) {
-        return {
-            action: 'ignored_locked',
-            attendanceId: existing.attendance_id,
-        };
-    }
-
-    if (existing.status === 'Rejected') {
-        return {
-            action: 'ignored_rejected',
-            attendanceId: existing.attendance_id,
-        };
-    }
-
-    if (!existing.check_in_time) {
-        return {
-            action: 'no_check_in',
-            attendanceId: existing.attendance_id,
-        };
-    }
-
-    if (existing.check_out_time) {
-        return {
-            action: 'already_checked_out',
-            attendanceId: existing.attendance_id,
-        };
-    }
-
-    const checkIn = new Date(existing.check_in_time);
-    const checkOut = new Date(punchedAt);
-
-    if (
-        Number.isNaN(checkIn.getTime()) ||
-        Number.isNaN(checkOut.getTime()) ||
-        checkOut <= checkIn
-    ) {
-        return {
-            action: 'invalid_checkout_time',
-            attendanceId: existing.attendance_id,
-        };
-    }
+    if (openLeave) return { action: 'open_break', id };
 
     await executor.execute(
+      `UPDATE attendance SET check_out_time = ?, attendance_status = 'Present', updated_at = CURRENT_TIMESTAMP
+       WHERE attendance_id = ?`,
+      [punchWall, id]
+    );
+    await attendanceService.calculateWorkingHours(id, executor);
+  } else {
+    await executor.execute(
+      `UPDATE staff_attendance SET check_out_time = ?, updated_at = CURRENT_TIMESTAMP WHERE staff_attendance_id = ?`,
+      [punchWall, id]
+    );
+    await writeStaffHours(rec, inWall, punchWall, executor);
+  }
+
+  return { action: rec.check_out_time ? 'checked_out_updated_later' : 'checked_out', id };
+}
+
+// ---------- Worker IN (create) ----------
+async function workerIn(workerId, punchWall, userId, executor) {
+  const punchDate = punchWall.slice(0, 10);
+  const assignment = await resolveWorkerAssignment(workerId, punchDate, executor);
+
+  // Day and Night (or two sites) can never merge:
+  // session search is scoped to the assigned site/shift.
+  const session = await findSession(
+    'Worker',
+    workerId,
+    punchWall,
+    'IN',
+    executor,
+    assignment
+  );
+
+  if (session) {
+    return applyInToSession('Worker', session, punchWall, executor);
+  }
+
+  if (!assignment) return { unresolved: 'no_assignment' };
+  const [rows] = await executor.execute(
+    `SELECT * FROM attendance
+     WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND record_date = ? LIMIT 1 FOR UPDATE`,
+    [workerId, assignment.siteId, assignment.shiftType, punchDate]
+  );
+
+  if (rows.length) {
+    const ex = rows[0];
+    const blocked = gate(ex);
+    if (blocked) return { action: blocked, id: ex.attendance_id };
+    if (ex.source !== 'Biometric') return { action: 'ignored_manual', id: ex.attendance_id };
+    if (ex.status === 'Draft' && !ex.check_in_time) {
+      // Same reset the manual check-in does when reviving an Absent/Sick Draft.
+      await executor.execute(
         `UPDATE attendance
-         SET check_out_time = ?,
-             updated_at = CURRENT_TIMESTAMP
-         WHERE attendance_id = ?`,
-        [punchedAt, existing.attendance_id]
-    );
+         SET check_in_time = ?, attendance_status = 'Present', management_leave_hours = 0,
+             total_working_hours = NULL, overtime_hours = 0, remarks = NULL,
+             source = 'Biometric', updated_at = CURRENT_TIMESTAMP
+         WHERE attendance_id = ? AND status = 'Draft'`,
+        [punchWall, ex.attendance_id]
+      );
+      return { action: 'checked_in_existing', id: ex.attendance_id };
+    }
+    return { action: 'conflict_review', id: ex.attendance_id };
+  }
 
-    // Calculate Worker hours only after a valid checkout is saved.
-    await attendanceService.calculateWorkingHours(
-        existing.attendance_id,
-        executor
-    );
-
-    return {
-        action: 'checked_out',
-        attendanceId: existing.attendance_id,
-    };
+  const [ins] = await executor.execute(
+    `INSERT INTO attendance
+       (worker_id, site_id, shift_type, record_date, check_in_time, attendance_status,
+        status, recorded_by_user_id, source)
+     VALUES (?, ?, ?, ?, ?, 'Present', 'Draft', ?, 'Biometric')`,
+    [workerId, assignment.siteId, assignment.shiftType, punchDate, punchWall, userId]
+  );
+  return { action: 'created', id: ins.insertId };
 }
 
-/**
- * Main entry point for one raw biometric punch.
- *
- * IMPORTANT:
- * - Does not modify attendance_punches.
- * - Does not perform payroll.
- * - Does not call HTTP controllers.
- */
-async function processPunch(punch, recordedByUserId) {
-    if (!Number.isInteger(Number(recordedByUserId)) || Number(recordedByUserId) <= 0) {
-    throw createServiceError(
-        'A valid recordedByUserId is required for biometric attendance.'
-    );
-}
-    const connection = await db.getConnection();
+// ---------- Staff IN (create) ----------
+async function staffIn(staffId, punchWall, userId, executor) {
+  const session = await findSession('Staff', staffId, punchWall, 'IN', executor);
+  if (session) return applyInToSession('Staff', session, punchWall, executor);
 
-    try {
-        await connection.beginTransaction();
+  const punchDate = punchWall.slice(0, 10);
 
-        const resolved = await resolvePunchContext(
-            punch,
-            connection
-        );
+  const [[sm]] = await executor.execute(
+    'SELECT status, standard_daily_hours FROM staff_members WHERE staff_id = ? FOR UPDATE',
+    [staffId]
+  );
+  if (!sm || sm.status !== 'Active') return { unresolved: 'staff_inactive' };
 
-        if (resolved.status !== 'resolved') {
-            await connection.commit();
+  const spans = await getActiveSpansOverlapping(staffId, punchDate, punchDate, executor);
+  if (spans.length === 0) return { unresolved: 'not_employed_on_date' };
 
-            return {
-                processed: false,
-                status: resolved.status,
-                context: resolved.context,
-            };
-        }
+  // A staff record nobody can see/submit is useless: require a current supervisor.
+   const [sup] = await executor.execute(
+    `SELECT 1 FROM staff_supervisor_assignments
+     WHERE staff_id = ? AND assigned_date <= ?
+       AND (unassigned_date IS NULL OR unassigned_date > ?) LIMIT 1`,
+    [staffId, punchDate, punchDate]
+  );
+  if (!sup.length) return { unresolved: 'no_supervisor_assignment' };
 
-        const context = resolved.context;
-        context.recordedByUserId = Number(recordedByUserId);
-
-        let result;
-
-if (context.entityType === 'Worker') {
-    if (punch.punch_type === 'IN') {
-        result = await applyWorkerIn(
-            context,
-            punch.punched_at,
-            context.recordedByUserId,   // new argument
-            connection
-        );
-    } else if (punch.punch_type === 'OUT') {
-        result = await applyWorkerOut(
-            context,
-            punch.punched_at,
-            connection
-        );
-    } else {
-        throw createServiceError(
-            `Unsupported punch type: ${punch.punch_type}`
-        );
-    }
-} else if (context.entityType === 'Staff') {
-    if (punch.punch_type === 'IN') {
-        result = await applyStaffIn(
-            context,
-            punch.punched_at,
-            context.recordedByUserId,
-            connection
-        );
-    } else if (punch.punch_type === 'OUT') {
-        result = await applyStaffOut(
-            context,
-            punch.punched_at,
-            connection
-        );
-    } else {
-        throw createServiceError(
-            `Unsupported punch type: ${punch.punch_type}`
-        );
-    }
-} else {
-    throw createServiceError(
-        `Unsupported biometric entity type: ${context.entityType}`,
-        409
-    );
-}
-
-        await connection.commit();
-
-        return {
-            processed: true,
-            status: 'processed',
-            context,
-            result,
-        };
-    } catch (error) {
-        try {
-            await connection.rollback();
-        } catch (_) {}
-
-        throw error;
-    } finally {
-        connection.release();
-    }
-}
-/**
- * Apply biometric IN punch to Staff attendance.
- *
- * Staff attendance is unique by:
- *   staff_id + record_date
- *
- * Staff has no site/shift dimension in staff_attendance.
- */
-async function applyStaffIn(
-    context,
-    punchedAt,
-    recordedByUserId,
-    executor
-) {
-    const existing = await getStaffAttendance(
-        context.staffId,
-        context.recordDate,
-        executor,
-        true
-    );
-
-    if (existing) {
-        /*
-         * Submitted and Approved are locked.
-         * Biometric processing must never overwrite them.
-         */
-        if (
-            existing.status === 'Submitted' ||
-            existing.status === 'Approved'
-        ) {
-            return {
-                action: 'ignored_locked',
-                staffAttendanceId: existing.staff_attendance_id,
-            };
-        }
-
-        /*
-         * A rejected record must be handled through the normal
-         * Staff resubmission flow, not silently changed by biometric.
-         */
-        if (existing.status === 'Rejected') {
-            return {
-                action: 'ignored_rejected',
-                staffAttendanceId: existing.staff_attendance_id,
-            };
-        }
-
-        /*
-         * Existing Draft with check-in:
-         * Treat another IN punch as duplicate/repeated punch.
-         */
-        if (existing.check_in_time) {
-            return {
-                action: 'already_checked_in',
-                staffAttendanceId: existing.staff_attendance_id,
-            };
-        }
-
-        /*
-         * Existing Draft without check-in:
-         * Fill the check-in time.
-         */
-        await executor.execute(
-            `UPDATE staff_attendance
-             SET check_in_time = ?,
-                 attendance_status = 'Present',
-                 recorded_by_user_id = ?,
-                 updated_at = CURRENT_TIMESTAMP
-             WHERE staff_attendance_id = ?`,
-            [
-                punchedAt,
-                recordedByUserId,
-                existing.staff_attendance_id,
-            ]
-        );
-
-        return {
-            action: 'checked_in_existing',
-            staffAttendanceId: existing.staff_attendance_id,
-        };
-    }
-
-    /*
-     * No attendance exists for this Staff/date.
-     *
-     * Create a normal Draft Present record.
-     *
-     * We intentionally do NOT calculate hours here.
-     * Existing Staff attendance/payroll logic remains responsible
-     * for working hours, lunch, overtime, Friday rules, etc.
-     */
-    const [result] = await executor.execute(
-        `INSERT INTO staff_attendance (
-            staff_id,
-            record_date,
-            check_in_time,
-            attendance_status,
-            is_friday_worked,
-            is_paid,
-            is_management_paid_absence,
-            recorded_by_user_id,
-            status
-         )
-         VALUES (
-            ?, ?, ?, 'Present', 0, 1, 0, ?, 'Draft'
-         )`,
-        [
-            context.staffId,
-            context.recordDate,
-            punchedAt,
-            recordedByUserId,
-        ]
-    );
-
-    return {
-        action: 'created',
-        staffAttendanceId: result.insertId,
-    };
-}
-
-
-/**
- * Apply biometric OUT punch to Staff attendance.
- *
- * An OUT punch never creates a new Staff attendance record.
- */
-async function applyStaffOut(
-    context,
-    punchedAt,
-    executor
-) {
-    const existing = await getStaffAttendance(
-        context.staffId,
-        context.recordDate,
-        executor,
-        true
-    );
-
-    if (!existing) {
-        return {
-            action: 'no_open_attendance',
-            staffAttendanceId: null,
-        };
-    }
-
-    /*
-     * Submitted and Approved are locked.
-     */
-    if (
-        existing.status === 'Submitted' ||
-        existing.status === 'Approved'
-    ) {
-        return {
-            action: 'ignored_locked',
-            staffAttendanceId: existing.staff_attendance_id,
-        };
-    }
-
-    /*
-     * Rejected records must go through the existing Staff
-     * resubmission flow.
-     */
-    if (existing.status === 'Rejected') {
-        return {
-            action: 'ignored_rejected',
-            staffAttendanceId: existing.staff_attendance_id,
-        };
-    }
-
-    /*
-     * Cannot checkout if there is no check-in.
-     */
-    if (!existing.check_in_time) {
-        return {
-            action: 'no_check_in',
-            staffAttendanceId: existing.staff_attendance_id,
-        };
-    }
-
-    /*
-     * Duplicate OUT.
-     */
-    if (existing.check_out_time) {
-        return {
-            action: 'already_checked_out',
-            staffAttendanceId: existing.staff_attendance_id,
-        };
-    }
-
-    /*
-     * Validate chronological order.
-     */
-    const checkIn = new Date(existing.check_in_time);
-    const checkOut = new Date(punchedAt);
-
-    if (
-        Number.isNaN(checkIn.getTime()) ||
-        Number.isNaN(checkOut.getTime()) ||
-        checkOut <= checkIn
-    ) {
-        return {
-            action: 'invalid_checkout_time',
-            staffAttendanceId: existing.staff_attendance_id,
-        };
-    }
-
- 
-        // Standard hours: same rule as the supervisor flow
-    // (row snapshot first, else the staff profile, else 8h).
-    const [[staffRow]] = await executor.execute(
-        `SELECT standard_daily_hours FROM staff_members WHERE staff_id = ?`,
-        [context.staffId]
-    );
-    const profileHours = Number(staffRow?.standard_daily_hours) > 0
-        ? Number(staffRow.standard_daily_hours)
-        : 8;
-    const snapshotMinutes = Number(existing.standard_minutes_snapshot) > 0
-        ? Number(existing.standard_minutes_snapshot)
-        : Math.round(profileHours * 60);
-
-    // Existing Staff calculation (no formula changes, no Worker code).
-    const shift = calculateStaffShiftHours({
-        checkInRaw: existing.check_in_time,
-        checkOutRaw: punchedAt,
-        lunchStartRaw: existing.lunch_start_time,
-        lunchEndRaw: existing.lunch_end_time,
-        recordDate: context.recordDate,
-        standardDailyHours: snapshotMinutes / 60,
-    });
-
-    await executor.execute(
+  const [rows] = await executor.execute(
+    `SELECT * FROM staff_attendance WHERE staff_id = ? AND record_date = ? LIMIT 1 FOR UPDATE`,
+    [staffId, punchDate]
+  );
+  if (rows.length) {
+    const ex = rows[0];
+    const blocked = gate(ex);
+    if (blocked) return { action: blocked, id: ex.staff_attendance_id };
+    if (ex.source !== 'Biometric') return { action: 'ignored_manual', id: ex.staff_attendance_id };   // NEW
+    if (ex.status === 'Draft' && !ex.check_in_time) {
+      await executor.execute(
         `UPDATE staff_attendance
-         SET check_out_time = ?,
-             regular_hours = ?,
-             overtime_hours = ?,
-             lunch_deducted_hours = ?,
-             standard_minutes_snapshot = COALESCE(standard_minutes_snapshot, ?),
-             updated_at = CURRENT_TIMESTAMP
+         SET check_in_time = ?, attendance_status = 'Present', source = 'Biometric',
+             recorded_by_user_id = ?, updated_at = CURRENT_TIMESTAMP
          WHERE staff_attendance_id = ?`,
-        [
-            punchedAt,
-            shift.regularHours.toFixed(2),
-            shift.overtimeHours.toFixed(2),
-            shift.lunchHours.toFixed(2),
-            snapshotMinutes,
-            existing.staff_attendance_id,
-        ]
-    );
+        [punchWall, userId, ex.staff_attendance_id]
+      );
+      return { action: 'checked_in_existing', id: ex.staff_attendance_id };
+    }
+    return { action: 'conflict_review', id: ex.staff_attendance_id };
+  }
 
-    return {
-        action: 'checked_out',
-        staffAttendanceId: existing.staff_attendance_id,
-    };
+  const hours = Number(sm.standard_daily_hours) > 0 ? Number(sm.standard_daily_hours) : 8;
+
+  // Friday: created with is_friday_worked = 0. The supervisor must confirm it
+  // (submit is blocked until confirmed, see staffAttendanceSupervisorController).
+  const [ins] = await executor.execute(
+    `INSERT INTO staff_attendance
+       (staff_id, record_date, check_in_time, attendance_status, is_friday_worked, is_paid,
+        is_management_paid_absence, standard_minutes_snapshot, recorded_by_user_id, status, source)
+     VALUES (?, ?, ?, 'Present', 0, 1, 0, ?, ?, 'Draft', 'Biometric')`,
+    [staffId, punchDate, punchWall, Math.round(hours * 60), userId]
+  );
+  return { action: 'created', id: ins.insertId };
 }
-module.exports = {
-    getWorkerRecordDate,
-    resolveWorkerAssignment,
-    resolvePunchContext,
-    getWorkerAttendance,
-    getStaffAttendance,
-    processPunch,
-};
+
+// ---------- Entry point ----------
+async function processPunch(punch, recordedByUserId) {
+  const userId = Number(recordedByUserId);
+  if (!Number.isInteger(userId) || userId <= 0) {
+    throw createServiceError('A valid recordedByUserId is required for biometric attendance.');
+  }
+  if (!punch || !punch.device_employee_id || !punch.punched_at) {
+    throw createServiceError('device_employee_id and punched_at are required.');
+  }
+
+  const punchWall = toWall(punch.punched_at);
+  const windowIssue = checkPunchWindow(punchWall.slice(0, 10));
+  if (windowIssue) return { processed: false, status: windowIssue };
+
+  const connection = await db.getConnection();
+  try {
+    await connection.beginTransaction();
+
+    const mapping = await biometricDeviceUserService.resolveDeviceUser(
+      punch.device_employee_id, punchWall, connection
+    );
+    if (!mapping) {
+      await connection.commit();
+      return { processed: false, status: 'unmapped' };
+    }
+
+    const kind = mapping.entity_type;
+    if (kind !== 'Worker' && kind !== 'Staff') {
+      throw createServiceError(`Unsupported biometric entity type: ${kind}`, 409);
+    }
+    const ownerId = kind === 'Worker' ? mapping.worker_id : mapping.staff_id;
+
+    let result;
+    if (punch.punch_type === 'IN') {
+      result = kind === 'Worker'
+        ? await workerIn(ownerId, punchWall, userId, connection)
+        : await staffIn(ownerId, punchWall, userId, connection);
+    } else if (punch.punch_type === 'OUT') {
+      const rec = await findSession(kind, ownerId, punchWall, 'OUT', connection);
+      result = rec
+        ? await applyOutToSession(kind, rec, punchWall, connection)
+        : { action: 'no_open_attendance', id: null };
+    } else {
+      throw createServiceError(`Unsupported punch type: ${punch.punch_type}`);
+    }
+
+    await connection.commit();
+
+    if (result.unresolved) return { processed: false, status: result.unresolved };
+    return { processed: true, status: 'processed', result };
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    throw error;
+  } finally {
+    connection.release();
+  }
+}
+
+module.exports = { processPunch, resolveWorkerAssignment, findSession };

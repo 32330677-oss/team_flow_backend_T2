@@ -588,16 +588,38 @@ if (status === 'Present') {
     }
 
     if (mode === 'submit' && !isResubmit) {
-      // Promote only Draft rows for this date. Rejected, Submitted, and
-      // Approved rows are deliberately excluded from this day submission.
       const [drafts] = await connection.execute(
-        `SELECT staff_attendance_id, staff_id
-         FROM staff_attendance
-         WHERE record_date = ? AND status = 'Draft'
-           AND staff_id IN (${assignedIds.map(() => '?').join(',')})
-         FOR UPDATE`,
+        `SELECT sa.staff_attendance_id, sa.staff_id, sa.attendance_status,
+                sa.check_in_time, sa.check_out_time, sa.is_friday_worked, sm.full_name
+         FROM staff_attendance sa
+         JOIN staff_members sm ON sm.staff_id = sa.staff_id
+         WHERE sa.record_date = ? AND sa.status = 'Draft'
+           AND sa.staff_id IN (${assignedIds.map(() => '?').join(',')})
+         FOR UPDATE OF sa`,
         [record_date, ...assignedIds]
       );
+
+      // Rule: Present without a real check-in AND check-out can never become Submitted.
+      const incomplete = drafts.filter((d) =>
+        d.attendance_status === 'Present' && (!d.check_in_time || !d.check_out_time));
+      if (incomplete.length > 0) {
+        throw new AppError(
+          `Cannot submit. Missing check-out (wait for the biometric OUT or enter it manually): ` +
+          incomplete.map((d) => d.full_name).join(', ')
+        );
+      }
+
+      // Biometric Friday records are created unconfirmed; they must be confirmed first.
+      if (dayIsFriday) {
+        const unconfirmed = drafts.filter((d) =>
+          d.attendance_status === 'Present' && Number(d.is_friday_worked) !== 1);
+        if (unconfirmed.length > 0) {
+          throw new AppError(
+            `Friday attendance needs confirmation for: ${unconfirmed.map((d) => d.full_name).join(', ')}`
+          );
+        }
+      }
+
       for (const draft of drafts) {
         await connection.execute(
           `UPDATE staff_attendance
@@ -608,15 +630,10 @@ if (status === 'Present') {
         );
         results.updated.push(draft.staff_id);
         await connection.execute(
-          `INSERT INTO auditlogs
-             (table_name, record_id, action_type, user_id, old_values, new_values)
+          `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
            VALUES ('staff_attendance', ?, 'SUPERVISOR_ATTENDANCE_SUBMITTED', ?, ?, ?)`,
-          [
-            draft.staff_attendance_id,
-            supervisorId,
-            JSON.stringify({ status: 'Draft' }),
-            JSON.stringify({ status: 'Submitted', staff_id: draft.staff_id, record_date })
-          ]
+          [draft.staff_attendance_id, supervisorId, JSON.stringify({ status: 'Draft' }),
+            JSON.stringify({ status: 'Submitted', staff_id: draft.staff_id, record_date })]
         );
       }
     }

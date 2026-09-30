@@ -141,10 +141,7 @@ async function listAvailableEntities(req, res) {
 
     if (entityType === 'Worker') {
       [rows] = await db.execute(
-        `SELECT
-            w.worker_id,
-            w.worker_unique_id,
-            w.full_name
+        `SELECT w.worker_id, w.worker_unique_id, w.full_name, w.hire_date AS start_date 
          FROM workers w
          WHERE w.status = 'Active'
            AND NOT EXISTS (
@@ -158,11 +155,8 @@ async function listAvailableEntities(req, res) {
       );
     } else {
       [rows] = await require('../config/db').execute(
-        `SELECT
-            sm.staff_id,
-            sm.staff_unique_id,
-            sm.full_name,
-            sm.position
+       `SELECT sm.staff_id, sm.staff_unique_id, sm.full_name, sm.position,
+        COALESCE(sm.first_hire_date, sm.hire_date) AS start_date 
          FROM staff_members sm
          WHERE sm.status = 'Active'
            AND NOT EXISTS (
