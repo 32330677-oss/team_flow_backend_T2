@@ -2,30 +2,10 @@
 const ExcelJS = require('exceljs');
 const pool = require('../config/db');
 
-const MONTH_NAMES = ['January','February','March','April','May','June','July',
-  'August','September','October','November','December'];
-const SYP_FMT = '#,##0 "ل.س"';
-const pad = (n) => String(n).padStart(2, '0');
+const { parsePeriod, renderReport, badRequest } = require('./monthlyReportExcelLayout');
+const { renderReportPdf } = require('./monthlyReportPdfLayout');
+
 const round2 = (v) => Math.round((Number(v || 0) + Number.EPSILON) * 100) / 100;
-
-function badRequest(message) {
-  const e = new Error(message);
-  e.statusCode = 400;
-  return e;
-}
-
-function parseMonthYear(month, year) {
-  const m = Number(month);
-  const y = Number(year);
-  if (!Number.isInteger(m) || m < 1 || m > 12) throw badRequest('month must be an integer between 1 and 12.');
-  if (!Number.isInteger(y) || y < 2020 || y > 2100) throw badRequest('year must be between 2020 and 2100.');
-  const daysInMonth = new Date(Date.UTC(y, m, 0)).getUTCDate();
-  return {
-    m, y, daysInMonth,
-    monthStart: `${y}-${pad(m)}-01`,
-    monthEnd: `${y}-${pad(m)}-${pad(daysInMonth)}`,
-  };
-}
 
 async function loadData(monthStart, monthEnd) {
   const [attendance] = await pool.execute(
@@ -95,7 +75,7 @@ function aggregate({ attendance, batches, payrolls, items, workers }, monthStart
         name: w.full_name || `Worker #${id}`,
         trade: w.job_position || '',
         sites: new Set(), shifts: new Set(),
-        days: {}, normal: 0, ot: 0,
+        days: {}, dayOt: {}, normal: 0, ot: 0,
         hasPay: false, basic: 0, otPay: 0, total: 0,
         payOt: 0, covOt: 0, uncovered: 0, nonApproved: 0, partialBatch: false,
         flags: [],
@@ -115,6 +95,7 @@ function aggregate({ attendance, batches, payrolls, items, workers }, monthStart
     const ot = Number(a.overtime_hours || 0);
     const day = Number(a.record_date.slice(8, 10));
     r.days[day] = (r.days[day] || 0) + reg + ot;
+    r.dayOt[day] = (r.dayOt[day] || 0) + ot;
     r.normal += reg;
     r.ot += ot;
     if (a.site_name) r.sites.add(a.site_name);
@@ -151,13 +132,13 @@ function aggregate({ attendance, batches, payrolls, items, workers }, monthStart
     }
     if (b.start_date < monthStart || b.end_date > monthEnd) {
       r.partialBatch = true;
-      r.flags.push(`Batch #${b.payroll_batch_id} (${b.start_date} → ${b.end_date}) extends outside the selected month; pay covers the whole batch`);
+      r.flags.push(`Batch #${b.payroll_batch_id} (${b.start_date} → ${b.end_date}) extends outside the selected period; pay covers the whole batch`);
     }
     if (!b.is_finalized) r.flags.push(`Batch #${b.payroll_batch_id} is not finalized`);
   }
 
   for (const r of rows.values()) {
-    if (!r.hasPay && r.normal + r.ot > 0) r.flags.push('No payroll batch covers this worker in the selected month (pay left blank)');
+    if (!r.hasPay && r.normal + r.ot > 0) r.flags.push('No payroll batch covers this worker in the selected period (pay left blank)');
     if (r.hasPay && r.uncovered > 0) r.flags.push(`${r.uncovered} approved attendance record(s) not covered by any payroll batch`);
     if (r.nonApproved > 0) r.flags.push(`${r.nonApproved} non-approved attendance record(s) excluded (Draft/Submitted/Rejected)`);
     if (r.hasPay && !r.partialBatch && Math.abs(r.covOt - r.payOt) > 0.01) {
@@ -170,97 +151,114 @@ function aggregate({ attendance, batches, payrolls, items, workers }, monthStart
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function buildWorkbook(rows, batches, { m, y, daysInMonth }) {
-  const wb = new ExcelJS.Workbook();
-  const ws = wb.addWorksheet('Labor Hours & Payroll');
+function buildSpec(rows, batches, period) {
 
-  const fixed = ['No.', 'Worker Name', 'Worker ID', 'Trade / Position', 'Site', 'Shift'];
-  const tail = ['Monthly Hours', 'NORMAL HOURS', 'OT HOURS', 'BASIC PAY', 'OT PAY', 'TOTAL', 'Notes'];
-  const dayHeaders = Array.from({ length: daysInMonth }, (_, i) => i + 1);
-  const lastCol = fixed.length + daysInMonth + tail.length;
-  const c0 = fixed.length + daysInMonth; // 1-based index just before "Monthly Hours"
-
-  ws.mergeCells(1, 1, 1, lastCol);
-  ws.getCell(1, 1).value = `Monthly Labor Hours & Payroll Report — ${MONTH_NAMES[m - 1]} ${y}`;
-  ws.getCell(1, 1).font = { bold: true, size: 15 };
-  ws.mergeCells(2, 1, 2, lastCol);
-  ws.getCell(2, 1).value =
-    'Currency: Syrian Pound (ل.س). Hours: approved attendance only. Pay: stored values from payroll batches (not recalculated).';
-  ws.mergeCells(3, 1, 3, lastCol);
-  ws.getCell(3, 1).value = batches.length
-    ? 'Payroll batches used: ' + batches.map((b) =>
-        `#${b.payroll_batch_id} (${b.start_date} → ${b.end_date}, ${b.status}${b.is_finalized ? ', finalized' : ', not finalized'})`).join('; ')
-    : 'No payroll batch overlaps this month — pay columns are blank.';
-  ws.getRow(1).height = 26;
-
-  const header = ws.getRow(5);
-  header.values = [...fixed, ...dayHeaders, ...tail];
-  header.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-  header.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1A2A6C' } };
-  header.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
-  header.height = 30;
-
-  const totals = { days: Array(daysInMonth).fill(0), monthly: 0, normal: 0, ot: 0, basic: 0, otPay: 0, total: 0 };
-
-  rows.forEach((r, idx) => {
+  const t = { days: {}, monthly: 0, normal: 0, ot: 0, basic: 0, otPay: 0, total: 0 };
+  const flags = [];
+  const outRows = rows.map((r, idx) => {
     const monthly = r.normal + r.ot;
-    const dayCells = dayHeaders.map((d) => (r.days[d] ? round2(r.days[d]) : ''));
-    dayHeaders.forEach((d) => { totals.days[d - 1] += r.days[d] || 0; });
-    totals.monthly += monthly; totals.normal += r.normal; totals.ot += r.ot;
-    if (r.hasPay) { totals.basic += r.basic; totals.otPay += r.otPay; totals.total += r.total; }
-
-    ws.addRow([
-      idx + 1, r.name, r.uid, r.trade, [...r.sites].join(', '), [...r.shifts].join(', '),
-      ...dayCells,
-      round2(monthly), round2(r.normal), round2(r.ot),
-      r.hasPay ? round2(r.basic) : '', r.hasPay ? round2(r.otPay) : '', r.hasPay ? round2(r.total) : '',
-      r.flags.join(' | '),
-    ]);
+    const days = {};
+    period.days.forEach(({ d }) => {
+      if (!r.days[d]) return;
+      days[d] = { value: round2(r.days[d]), tone: r.dayOt[d] > 0 ? 'ot' : undefined };
+      t.days[d] = round2((t.days[d] || 0) + r.days[d]);
+    });
+    t.monthly += monthly; t.normal += r.normal; t.ot += r.ot;
+    if (r.hasPay) { t.basic += r.basic; t.otPay += r.otPay; t.total += r.total; }
+    r.flags.forEach((f) => flags.push({ id: r.uid, name: r.name, flag: f }));
+    return {
+      fixed: [idx + 1, r.name, r.trade, [...r.shifts].map((x) => String(x).toUpperCase()).join(' / '),
+        r.uid, [...r.sites].join(', ')],
+      days,
+      tail: [round2(monthly), round2(r.normal), round2(r.ot),
+        r.hasPay ? round2(r.basic) : '', r.hasPay ? round2(r.otPay) : '', r.hasPay ? round2(r.total) : '',
+        r.flags.length],
+    };
   });
 
-  const tr = ws.addRow([
-    '', 'GRAND TOTAL', '', '', '', '',
-    ...totals.days.map((v) => (v ? round2(v) : '')),
-    round2(totals.monthly), round2(totals.normal), round2(totals.ot),
-    round2(totals.basic), round2(totals.otPay), round2(totals.total), '',
-  ]);
-  tr.font = { bold: true };
-  tr.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF2F4FA' } };
-
-  // widths + formats
-  [6, 26, 12, 18, 22, 10].forEach((w, i) => { ws.getColumn(i + 1).width = w; });
-  dayHeaders.forEach((_, i) => { ws.getColumn(fixed.length + 1 + i).width = 5.5; });
-  [12, 13, 11, 15, 13, 16, 60].forEach((w, i) => { ws.getColumn(c0 + 1 + i).width = w; });
-  for (let r = 6; r <= ws.rowCount; r += 1) {
-    for (let c = fixed.length + 1; c <= c0 + 3; c += 1) {
-      ws.getCell(r, c).numFmt = '0.00';
-      ws.getCell(r, c).alignment = { horizontal: 'center' };
-    }
-    [c0 + 4, c0 + 5, c0 + 6].forEach((c) => { ws.getCell(r, c).numFmt = SYP_FMT; });
-  }
-  ws.views = [{ state: 'frozen', xSplit: 3, ySplit: 5 }];
-
-  const fs = wb.addWorksheet('Flags');
-  fs.columns = [
-    { header: 'Worker ID', key: 'uid', width: 14 },
-    { header: 'Worker Name', key: 'name', width: 28 },
-    { header: 'Flag', key: 'flag', width: 110 },
+  const notes = [
+    'Hours: approved attendance only (manual & biometric final records). Pay: stored payroll batch values — not recalculated. Currency: Syrian Pound (ل.س).',
+    batches.length
+      ? 'Payroll batches: ' + batches.map((b) =>
+          `#${b.payroll_batch_id} (${b.start_date} → ${b.end_date}, ${b.status}${b.is_finalized ? ', finalized' : ', not finalized'})`).join(' • ')
+      : 'No payroll batch overlaps this period — pay columns are left blank.',
   ];
-  fs.getRow(1).font = { bold: true };
-  rows.forEach((r) => r.flags.forEach((f) => fs.addRow({ uid: r.uid, name: r.name, flag: f })));
-  if (fs.rowCount === 1) fs.addRow({ uid: '', name: '', flag: 'No flags — all checks passed.' });
+  if (!period.isFullMonth) {
+    notes.push('Custom date range: pay columns show the stored value of each overlapping payroll batch (a batch may cover days outside this range — see Flags).');
+  }
 
-  return wb;
+  return {
+    period,
+    currency: 'SYP',
+    sheetName: 'Labor Hours & Payroll',
+    title: `LABORS MONTHLY WORKING HOURS & PAYROLL — ${period.monthLabel.toUpperCase()}`,
+    subtitle: `Period: ${period.periodLabel}   •   ${period.rangeStart} → ${period.rangeEnd}   •   Generated ${new Date().toISOString().slice(0, 16).replace('T', ' ')}`,
+    notes,
+    kpis: [
+      { label: 'Workers', value: rows.length, fmt: 'int' },
+      { label: 'Monthly Hours', value: round2(t.monthly), fmt: 'hours' },
+      { label: 'Normal Hours', value: round2(t.normal), fmt: 'hours' },
+      { label: 'OT Hours', value: round2(t.ot), fmt: 'hours' },
+      { label: 'Basic Pay', value: round2(t.basic), fmt: 'money' },
+      { label: 'OT Pay', value: round2(t.otPay), fmt: 'money' },
+      { label: 'Total Payroll', value: round2(t.total), fmt: 'money' },
+    ],
+    fixedCols: [
+      { header: 'S/N', width: 5 },
+      { header: 'Worker Name', width: 28, align: 'left', fontSize: 11, bold: true },
+      { header: 'TRADE', width: 14 },
+      { header: 'Shift', width: 9 },
+      { header: 'Worker ID', width: 13 },
+      { header: 'Site', width: 18 },
+    ],
+    tailCols: [
+      { header: 'Monthly\nHours', width: 11, kind: 'hoursStrong' },
+      { header: 'NORMAL\nHOURS', width: 11, kind: 'hours' },
+      { header: 'OT\nHOURS', width: 10, kind: 'hours' },
+      { header: 'BASIC\nPAY', width: 17, kind: 'money' },
+      { header: 'OT\nPAY', width: 16, kind: 'money' },
+      { header: 'TOTAL', width: 18, kind: 'total' },
+      { header: 'Flags', width: 8, kind: 'flags' },
+    ],
+    days: period.days,
+    rows: outRows,
+    totals: {
+      days: t.days,
+      tail: [round2(t.monthly), round2(t.normal), round2(t.ot), round2(t.basic), round2(t.otPay), round2(t.total), ''],
+    },
+    legend: [
+      { code: '11', tone: 'ot', label: 'Day includes overtime hours' },
+      { code: 'Fri', tone: 'friday', label: 'Friday' },
+    ],
+    flags,
+    entityLabel: 'workers',
+    entityIdLabel: 'Worker ID',
+    entityNameLabel: 'Worker Name',
+  };
 }
 
-async function generateWorkerMonthlyReport(month, year) {
-  const period = parseMonthYear(month, year);
-  const data = await loadData(period.monthStart, period.monthEnd);
-  const rows = aggregate(data, period.monthStart, period.monthEnd);
-  if (!rows.length) throw badRequest('No approved attendance or payroll data found for the selected month.');
-  const wb = buildWorkbook(rows, data.batches, period);
+async function loadSpec(month, year, from, to) {
+  const period = parsePeriod(month, year, from, to);
+  const data = await loadData(period.rangeStart, period.rangeEnd);
+  const rows = aggregate(data, period.rangeStart, period.rangeEnd);
+  if (!rows.length) throw badRequest('No approved attendance or payroll data found for the selected period.');
+  return buildSpec(rows, data.batches, period);
+}
+
+async function generateWorkerMonthlyReport(month, year, from, to) {
+  const spec = await loadSpec(month, year, from, to);
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Team Flow';
+  wb.created = new Date();
+  renderReport(wb, spec);
   const buffer = await wb.xlsx.writeBuffer();
-  return { buffer, fileName: `labor_hours_payroll_${period.y}-${pad(period.m)}.xlsx` };
+  return { buffer, fileName: `labor_hours_payroll_${spec.period.fileSuffix}.xlsx` };
 }
 
-module.exports = { generateWorkerMonthlyReport };
+async function generateWorkerMonthlyReportPdf(month, year, from, to) {
+  const spec = await loadSpec(month, year, from, to);
+  const buffer = await renderReportPdf(spec);
+  return { buffer, fileName: `labor_hours_payroll_${spec.period.fileSuffix}.pdf` };
+}
+
+module.exports = { generateWorkerMonthlyReport, generateWorkerMonthlyReportPdf };

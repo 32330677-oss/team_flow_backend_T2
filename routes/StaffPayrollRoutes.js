@@ -13,6 +13,7 @@ router.use(restrictTo('Admin'));
 router.post('/generate', controller.generateStaffPayrollBatch);
 router.get('/report', controller.getStaffPayrollReport);
 router.get('/monthly-report.xlsx', staffMonthlyReport.exportStaffMonthlyReport);
+router.get('/monthly-report.pdf', staffMonthlyReport.exportStaffMonthlyReportPdf);
 router.get('/batch/:batchId', controller.getStaffPayrollBatchDetails);
 router.get('/batch/:batchId/export.xlsx', controller.exportStaffPayrollExcel); // ← جديد
 router.get('/batch/:batchId/export.pdf', controller.exportStaffPayrollPdf); // ← جديد

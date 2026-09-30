@@ -15,6 +15,7 @@ router.get('/batch/:batchId/export.xlsx', controller.exportPayrollExcel);
 router.get('/batch/:batchId/export.pdf', controller.exportPayrollPdf);
 router.get('/daily-attendance/export.xlsx', controller.exportDailyAttendanceExcel);
 router.get('/monthly-report.xlsx', monthlyReport.exportWorkerMonthlyReport);
+router.get('/monthly-report.pdf', monthlyReport.exportWorkerMonthlyReportPdf);
 router.patch('/batch/:batchId/mark-paid', controller.markBatchAsPaid);
 router.patch('/batch/:batchId/finalize', controller.finalizePayrollBatch);
 router.get('/batch/:batchId/versions', controller.getPayrollVersionChain);
