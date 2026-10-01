@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const db = require('../config/db');
+const { businessToday } = require('../services/businessDate');
 const authMiddleware = require('../middleware/authMiddleware');
 const restrictTo = require('../middleware/roleMiddleware');
 
@@ -37,8 +38,9 @@ router.get('/', authMiddleware, restrictTo('Admin', 'Supervisor'), async (req, r
 router.delete('/:assignment_id', authMiddleware, restrictTo('Admin'), async (req, res) => {
     try {
         const [result] = await db.query(
-            'UPDATE workersiteassignments SET unassigned_date = NOW(), updated_at = NOW() WHERE assignment_id = ? AND unassigned_date IS NULL',
-            [req.params.assignment_id]
+            // B10: the end date is the business date, not the DB server date.
+            'UPDATE workersiteassignments SET unassigned_date = ?, updated_at = NOW() WHERE assignment_id = ? AND unassigned_date IS NULL',
+            [businessToday(), req.params.assignment_id]
         );
         if (result.affectedRows === 0) {
             return res.status(404).json({ status: 'fail', message: 'التعيين غير موجود أو أنه منتهي بالفعل!' });
@@ -67,7 +69,7 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
         if (!isValidDate) {
             return res.status(400).json({ status: 'fail', message: 'Invalid assigned_date format (YYYY-MM-DD).' });
         }
-        const todayStr = new Date().toISOString().slice(0, 10);
+        const todayStr = businessToday();   // B10: business date
         if (raw > todayStr) {
             return res.status(400).json({ status: 'fail', message: 'assigned_date cannot be a future date.' });
         }
@@ -162,7 +164,7 @@ router.post('/', authMiddleware, restrictTo('Admin'), async (req, res) => {
                     site_id,
                     contract_id,
                     assigned_by_user_id,
-                    effectiveAssignedDate || new Date().toISOString().slice(0, 10),
+                    effectiveAssignedDate || businessToday(),   // B10
                     shift_type,
                 ]
             );

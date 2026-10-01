@@ -12,6 +12,7 @@
 //   router.get('/:id/lifecycle-history', restrictTo('Admin'), staffLifecycleController.getStatusHistory);
 
 const db = require('../config/db');
+const { businessToday } = require('../services/businessDate');
 const { getActiveSpans } = require('../services/staffEmploymentService'); // ← جديد
 const VALID_STATUSES = ['Active', 'Inactive', 'Terminated'];
 
@@ -41,7 +42,7 @@ exports.changeStatus = async (req, res) => {
   if (!reason || !String(reason).trim()) {
     return res.status(400).json({ status: 'error', message: 'A reason is required for any status change.' });
   }
-  if (new_status === 'Terminated' && effective_date > new Date().toISOString().slice(0, 10)) {
+  if (new_status === 'Terminated' && effective_date > businessToday()) {
     return res.status(400).json({ status: 'error', message: 'Termination effective date cannot be in the future.' });
   }
 

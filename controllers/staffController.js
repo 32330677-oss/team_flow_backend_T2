@@ -1,5 +1,7 @@
 const db = require('../config/db');
 const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
+const { businessToday, isValidDateOnly: isValidBusinessDate } = require('../services/businessDate');
+const { recordStaffCompensationChange } = require('../services/staffCompensationService');
 
 const DEFAULT_DAILY_HOURS = 8.00;
 
@@ -154,7 +156,7 @@ exports.updateStaff = async (req, res) => {
     try {
         await connection.beginTransaction();
 
-        const [existing] = await connection.query('SELECT * FROM staff_members WHERE staff_id = ? LIMIT 1', [id]);
+        const [existing] = await connection.query('SELECT * FROM staff_members WHERE staff_id = ? LIMIT 1 FOR UPDATE', [id]);
         if (existing.length === 0) {
             throw Object.assign(new Error('Staff member not found'), { isOperational: true });
         }
@@ -212,6 +214,49 @@ exports.updateStaff = async (req, res) => {
             }
         }
 
+        // D3 / #12: salary, standard hours and paid leave types are versioned with
+        // the date they take effect, so payroll for earlier dates keeps the values
+        // that applied then. Default effective date = business today (same as
+        // the previous "applies now" behavior). Retroactive/future dates must be
+        // explicit and are limited to <= today.
+        const nextPaidLeave = paid_leave_types !== undefined ? parsePaidLeaveTypes(paid_leave_types) : current.paid_leave_types;
+        const normalizeJson = (v) => {
+            if (v === null || v === undefined || v === '') return null;
+            try { return JSON.stringify(typeof v === 'string' ? JSON.parse(v) : v); } catch (_) { return String(v); }
+        };
+        const compensationChanged =
+            Number(numericSalary) !== Number(current.monthly_salary) ||
+            Number(numericDailyHours) !== Number(current.standard_daily_hours) ||
+            normalizeJson(nextPaidLeave) !== normalizeJson(current.paid_leave_types);
+
+        if (compensationChanged) {
+            const compEffectiveFrom = req.body.compensation_effective_from || businessToday();
+            if (!isValidBusinessDate(compEffectiveFrom)) {
+                throw Object.assign(new Error('compensation_effective_from must be a valid date (YYYY-MM-DD).'), { isOperational: true });
+            }
+            if (compEffectiveFrom > businessToday()) {
+                throw Object.assign(new Error('A compensation change cannot take effect in the future.'), { isOperational: true });
+            }
+            await recordStaffCompensationChange(connection, {
+                current,
+                next: {
+                    monthly_salary: numericSalary,
+                    standard_daily_hours: numericDailyHours,
+                    paid_leave_types: normalizeJson(nextPaidLeave),
+                },
+                effectiveFrom: compEffectiveFrom,
+                reason: req.body.compensation_reason ? String(req.body.compensation_reason).trim().slice(0, 500) : null,
+                userId: req.user?.user_id,
+            });
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('staff_members', ?, 'COMPENSATION_CHANGED', ?, ?, ?)`,
+                [current.staff_id, req.user?.user_id || null,
+                    JSON.stringify({ monthly_salary: current.monthly_salary, standard_daily_hours: current.standard_daily_hours, paid_leave_types: current.paid_leave_types }),
+                    JSON.stringify({ monthly_salary: numericSalary, standard_daily_hours: numericDailyHours, paid_leave_types: normalizeJson(nextPaidLeave), effective_from: compEffectiveFrom, reason: req.body.compensation_reason || null })]
+            );
+        }
+
         await connection.query(
             `UPDATE staff_members
              SET full_name = ?, phone_number = ?, position = ?, site_id = ?,
@@ -225,7 +270,7 @@ exports.updateStaff = async (req, res) => {
                 effectiveHireDate,
                 numericSalary,
                 numericDailyHours,
-                paid_leave_types !== undefined ? parsePaidLeaveTypes(paid_leave_types) : current.paid_leave_types,
+                nextPaidLeave,
                 id
             ]
         );
@@ -242,5 +287,31 @@ exports.updateStaff = async (req, res) => {
         });
     } finally {
         connection.release();
+    }
+};
+
+
+// D3: GET /api/staff/:id/compensation-history
+exports.getCompensationHistory = async (req, res) => {
+    try {
+        const staffId = Number(req.params.id);
+        if (!Number.isInteger(staffId) || staffId <= 0) {
+            return res.status(400).json({ status: 'error', message: 'Invalid staff id.' });
+        }
+        const [rows] = await db.execute(
+            `SELECT sch.staff_compensation_id, sch.monthly_salary, sch.standard_daily_hours, sch.paid_leave_types,
+                    DATE_FORMAT(sch.effective_from, '%Y-%m-%d') AS effective_from,
+                    DATE_FORMAT(sch.effective_to, '%Y-%m-%d') AS effective_to,
+                    sch.reason, sch.created_at, u.full_name AS changed_by_name
+             FROM staff_compensation_history sch
+             LEFT JOIN users u ON u.user_id = sch.changed_by_user_id
+             WHERE sch.staff_id = ?
+             ORDER BY sch.effective_from DESC, sch.staff_compensation_id DESC`,
+            [staffId]
+        );
+        return res.status(200).json({ status: 'success', data: rows });
+    } catch (error) {
+        console.error('GET STAFF COMPENSATION HISTORY ERROR:', error);
+        return res.status(500).json({ status: 'error', message: 'Failed to load compensation history.' });
     }
 };

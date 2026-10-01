@@ -15,6 +15,7 @@ router.get('/my-assigned-staff', restrictTo('StaffSupervisor'), staffSupervisorA
 router.get('/', restrictTo('Admin'), staffController.getAllStaff);
 router.post('/', restrictTo('Admin'), staffController.createStaff);
 router.put('/:id', restrictTo('Admin'), staffController.updateStaff);
+router.get('/:id/compensation-history', restrictTo('Admin'), staffController.getCompensationHistory);
 
 // NEW — lifecycle tracking
 router.patch('/:id/lifecycle', restrictTo('Admin'), staffLifecycleController.changeStatus);

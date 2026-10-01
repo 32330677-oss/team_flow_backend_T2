@@ -173,9 +173,16 @@ let attSql = `
       ) || null;
     }
 
-    const fallbackStandardMinutes =
-      Number(await settingsCache.getSetting('standard_work_minutes', String(DEFAULT_STANDARD_MINUTES))) ||
+    // D3 / #13: the fallback standard minutes and the overtime flat rate are the
+    // values that applied on each record's own date (system_settings_history),
+    // falling back to the current value / constant when no dated value exists.
+    const fallbackStandardMinutesFor = async (dateStr) =>
+      Number(await settingsCache.getSettingForDate('standard_work_minutes', dateStr, String(DEFAULT_STANDARD_MINUTES))) ||
       DEFAULT_STANDARD_MINUTES;
+    const overtimeRateFor = async (dateStr) => {
+      const v = Number(await settingsCache.getSettingForDate('overtime_flat_rate_syp', dateStr, String(OVERTIME_FLAT_RATE_SYP)));
+      return Number.isFinite(v) && v >= 0 ? v : OVERTIME_FLAT_RATE_SYP;
+    };
 
     const groups = new Map();
     const byWorker = new Map();
@@ -191,10 +198,13 @@ let attSql = `
       }
 
       // Grouping key intentionally excludes overtime_hourly_rate: overtime is
-      // always paid at OVERTIME_FLAT_RATE_SYP regardless of that field.
+      // always paid at the flat company rate regardless of that field. The flat
+      // rate itself is dated (D3), so it is part of the key.
+      const recordDateStr = String(rec.record_date).slice(0, 10);
+      const otRate = await overtimeRateFor(recordDateStr);
       const groupKey = comp.payment_type === 'Daily'
-        ? `${rec.worker_id}|${rec.site_id}|Daily|${comp.daily_rate}`
-        : `${rec.worker_id}|${rec.site_id}|Hourly|${comp.regular_hourly_rate}`;
+        ? `${rec.worker_id}|${rec.site_id}|Daily|${comp.daily_rate}|OT${otRate}`
+        : `${rec.worker_id}|${rec.site_id}|Hourly|${comp.regular_hourly_rate}|OT${otRate}`;
 
       if (!groups.has(groupKey)) {
         groups.set(groupKey, {
@@ -204,6 +214,7 @@ let attSql = `
           pay_type: comp.payment_type,
           daily_rate: comp.daily_rate,
           regular_hourly_rate: comp.regular_hourly_rate,
+          overtime_rate: otRate,
           days_worked: 0,     // PAID day-equivalents (fractional, e.g. 0.5)
           regular_hours: 0,
           overtime_hours: 0,  // now tracked for BOTH pay types
@@ -221,7 +232,7 @@ let attSql = `
         } else {
           const standardMinutes = Number(rec.standard_minutes_snapshot) > 0
             ? Number(rec.standard_minutes_snapshot)
-            : fallbackStandardMinutes;
+            : await fallbackStandardMinutesFor(recordDateStr);
 
           const standardHours = standardMinutes / 60;
 
@@ -262,7 +273,7 @@ let attSql = `
       }
 
       // Unified flat-rate overtime for everyone, Daily or Hourly.
-      const overtimePay = money(g.overtime_hours * OVERTIME_FLAT_RATE_SYP);
+      const overtimePay = money(g.overtime_hours * g.overtime_rate);
 
       if (baseSalary === 0 && overtimePay === 0) continue;
 
@@ -276,6 +287,7 @@ let attSql = `
         daysWorked: Number(g.days_worked.toFixed(2)),
         regularHours: g.regular_hours,
         overtimeHours: g.overtime_hours,
+        overtimeRate: g.overtime_rate,
         baseSalary,
         overtimePay,
       });
@@ -346,7 +358,7 @@ let attSql = `
             item.siteId,
             item.payType,
             !isDaily ? item.hourlyRate : null,
-            item.overtimeHours > 0 ? OVERTIME_FLAT_RATE_SYP : null,
+            item.overtimeHours > 0 ? item.overtimeRate : null,
             isDaily ? item.dailyRate : null,
             isDaily ? item.daysWorked : null,
             !isDaily ? item.regularHours : null,
@@ -576,7 +588,8 @@ async function getPayrollBatchDetails(req, res) {
         overtime_hours_worked: sites.reduce((sum, s) => sum + Number(s.overtime_hours_worked || 0), 0),
         daily_rate: sites[0]?.daily_rate_snapshot ?? null,
         regular_rate: sites[0]?.hourly_rate_snapshot ?? null,
-        overtime_rate: OVERTIME_FLAT_RATE_SYP,
+        // The rate actually used is stored per item (dated, D3).
+        overtime_rate: Number(sites.find((x) => x.overtime_hourly_rate_snapshot != null)?.overtime_hourly_rate_snapshot ?? OVERTIME_FLAT_RATE_SYP),
         sites,
       };
     });
@@ -881,7 +894,7 @@ async function exportPayrollExcel(req, res) {
       sheet.mergeCells('A2:N2');
       sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)} - ${dateOnly(batch.end_date)}`;
       sheet.mergeCells('A3:N3');
-      sheet.getCell('A3').value = `Currency: Syrian Pound (ل.س) — Overtime rate: ${OVERTIME_FLAT_RATE_SYP} ل.س/hour (flat, all workers)`;
+      sheet.getCell('A3').value = 'Currency: Syrian Pound (ل.س) — Overtime: flat company rate per hour (see the Overtime Rate column)';
 
       sheet.mergeCells('A4:N4');
       sheet.getCell('A4').value = `Workers at this site: ${siteWorkerCount}`;

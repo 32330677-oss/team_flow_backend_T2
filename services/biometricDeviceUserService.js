@@ -15,6 +15,7 @@
 // Therefore "1" and "01" are different device IDs.
 
 const db = require('../config/db');
+const { businessToday } = require('./businessDate');
 const {
   acquireCreateLock,
   releaseCreateLock,
@@ -42,8 +43,9 @@ function isValidDeviceEmployeeId(value) {
   return DEVICE_ID_RE.test(String(value ?? ''));
 }
 
+// B10: business date (Asia/Beirut), not the UTC date.
 function todayDateOnly() {
-  return new Date().toISOString().slice(0, 10);
+  return businessToday();
 }
 
 // Accepts:
@@ -177,7 +179,13 @@ async function hasOverlappingMapping(
   return rows.length > 0;
 }
 
-async function getEntityForMapping(connection, entityType, entityId) {
+// D5: an OPEN-ended mapping (effective_to = NULL) requires the person to be
+// Active now. A CLOSED historical mapping (effective_to given) is allowed for
+// inactive workers and inactive/terminated staff, so their historical punches
+// can be mapped and processed. For a terminated staff member effective_to must
+// not exceed the termination date.
+async function getEntityForMapping(connection, entityType, entityId, effectiveTo = null) {
+  const isClosed = effectiveTo !== null && effectiveTo !== undefined && effectiveTo !== '';
   if (!Number.isInteger(entityId) || entityId <= 0) {
     throw createServiceError(
       `${entityType === 'Worker' ? 'worker_id' : 'staff_id'} must be a valid positive integer.`
@@ -202,9 +210,9 @@ async function getEntityForMapping(connection, entityType, entityId) {
 
     const worker = rows[0];
 
-    if (worker.status !== 'Active') {
+    if (worker.status !== 'Active' && !isClosed) {
       throw createServiceError(
-        'Cannot create a biometric mapping for an inactive Worker.'
+        'An open-ended biometric mapping requires an Active Worker. For an inactive Worker, provide effective_to (a closed historical mapping).'
       );
     }
 
@@ -231,7 +239,8 @@ async function getEntityForMapping(connection, entityType, entityId) {
        staff_id,
        status,
        hire_date,
-       first_hire_date
+       first_hire_date,
+       termination_date
      FROM staff_members
      WHERE staff_id = ?
      FOR UPDATE`,
@@ -244,10 +253,19 @@ async function getEntityForMapping(connection, entityType, entityId) {
 
   const staff = rows[0];
 
-  if (staff.status === 'Terminated') {
+  if (staff.status !== 'Active' && !isClosed) {
     throw createServiceError(
-      'Cannot create a biometric mapping for a terminated Staff member.'
+      `An open-ended biometric mapping requires an Active Staff member (current status: ${staff.status}). Provide effective_to for a closed historical mapping.`
     );
+  }
+
+  if (staff.status === 'Terminated' && isClosed && staff.termination_date) {
+    const terminationDate = String(staff.termination_date).slice(0, 10);
+    if (effectiveTo > terminationDate) {
+      throw createServiceError(
+        `effective_to cannot be after the staff member's termination date (${terminationDate}).`
+      );
+    }
   }
 
   const startDate = staff.first_hire_date
@@ -376,7 +394,8 @@ async function createDeviceUserMapping({
     const entity = await getEntityForMapping(
       connection,
       normalizedEntityType,
-      entityId
+      entityId,
+      effectiveTo || null
     );
 
     if (effectiveFrom < entity.start_date) {

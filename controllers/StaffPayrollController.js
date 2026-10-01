@@ -1,6 +1,7 @@
 const pool = require('../config/db');
 const { countNonFridayDays, listNonFridayDates, isFriday, round2 } = require('../services/staffAttendanceService');
 const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
+const { buildStaffCompensationResolver } = require('../services/staffCompensationService');
 function isValidDate(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
 }
@@ -94,10 +95,21 @@ const [batchResult] = await connection.execute(
         let totalStaff = 0;
         let totalAmount = 0;
         const pendingAttendance = [];
+        const compensationConflicts = [];
+
+        // Every calendar date of the batch period (used for compensation checks).
+        const periodDates = [];
+        for (let d = new Date(`${start_date}T00:00:00Z`); d <= new Date(`${end_date}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + 1)) {
+            periodDates.push(d.toISOString().slice(0, 10));
+        }
 
         for (const staff of staffList) {
-            const paidLeaveTypes = getPaidLeaveTypes(staff);
-            const standardDailyHours = Number(staff.standard_daily_hours) > 0 ? Number(staff.standard_daily_hours) : 8;
+            // D3 / #12: salary, standard hours and paid leave types come from the
+            // values that applied on each date (staff_compensation_history), not
+            // from today's profile. Staff without history keep the profile values
+            // (identical to the previous behavior).
+            const compAt = await buildStaffCompensationResolver(staff.staff_id, connection);
+            const paidLeaveTypesFor = (dateStr) => (compAt(dateStr)?.paid_leave_types) || getPaidLeaveTypes(staff);
 
 // Clamp to this staff member's actual employment window, and never
 // beyond "today" — future days have no attendance yet and must never
@@ -109,6 +121,28 @@ const [batchResult] = await connection.execute(
                 staff.staff_id, start_date, end_date, connection
             );
             if (employmentSpans.length === 0) continue; // غير موظف إطلاقاً خلال هذه الفترة
+            const periodVersions = new Map();
+            for (const d of periodDates.filter((day) => employmentSpans.some((sp) => day >= sp.start && (!sp.end || day <= sp.end)))) {
+                const c = compAt(d);
+                if (c) periodVersions.set(`${Number(c.monthly_salary)}|${Number(c.standard_daily_hours)}`, c);
+            }
+            if (periodVersions.size > 1) {
+                // How a salary/hours change INSIDE one payroll period is prorated is a
+                // business decision that has not been made yet -> never guess.
+                compensationConflicts.push({
+                    staff_id: staff.staff_id,
+                    full_name: staff.full_name,
+                    versions: [...periodVersions.values()].map((c) => ({
+                        monthly_salary: c.monthly_salary, standard_daily_hours: c.standard_daily_hours,
+                        effective_from: c.effective_from, effective_to: c.effective_to,
+                    })),
+                });
+                continue;
+            }
+            const periodComp = [...periodVersions.values()][0] || compAt(end_date);
+            staff.monthly_salary = periodComp ? periodComp.monthly_salary : staff.monthly_salary;
+            const standardDailyHours = periodComp ? periodComp.standard_daily_hours
+                : (Number(staff.standard_daily_hours) > 0 ? Number(staff.standard_daily_hours) : 8);
 
             const isDateInEmployment = (dateStr) => employmentSpans.some((span) =>
                 dateStr >= span.start && (!span.end || dateStr <= span.end)
@@ -232,7 +266,7 @@ for (const dateStr of calendarDates) {
             absenceShortfall += dailyStandardHours;   // ← لا يُغطى من الـ OT
             unpaidAbsenceDays += 1;
         }
-    } else if (paidLeaveTypes.includes(record.attendance_status) && Number(record.is_paid) === 1) {
+    } else if (paidLeaveTypesFor(dateStr).includes(record.attendance_status) && Number(record.is_paid) === 1) {
         actualRegularRaw += dailyStandardHours;
         paidLeaveDays += 1;
     } else {
@@ -312,6 +346,18 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
 
             totalStaff += 1;
             totalAmount = money(totalAmount + netSalary);
+        }
+
+        if (compensationConflicts.length > 0) {
+            await connection.rollback();
+            return res.status(409).json({
+                status: 'error',
+                code: 'COMPENSATION_CHANGED_MID_PERIOD',
+                message: 'Salary or standard hours change inside this payroll period for some staff members. ' +
+                    'The proration rule for a mid-period change has not been decided yet, so payroll is not generated. ' +
+                    'Generate the periods before and after the change separately, or contact the system owner.',
+                staff: compensationConflicts,
+            });
         }
 
         if (pendingAttendance.length > 0 && !acknowledgePending) {

@@ -2,6 +2,15 @@ const db = require('../config/db');
 const path = require('path');
 const fs = require('fs');
 const { generateTransferRequestDocx } = require('../services/transferDocumentService');
+const { businessToday, isValidDateOnly } = require('../services/businessDate');
+
+class TransferError extends Error {
+    constructor(message, statusCode = 400, extra = null) {
+        super(message);
+        this.statusCode = statusCode;
+        this.extra = extra;
+    }
+}
 
 function normalizeShift(value) {
     return ['Day', 'Night'].includes(value) ? value : 'Day';
@@ -21,6 +30,11 @@ async function verifySupervisorShiftScope(userId, siteId, shiftType) {
 // 1. إنشاء طلب تحويل جديد
 exports.createTransferRequest = async (req, res) => {
     const { worker_id, current_site_id, target_site_id, transfer_reason } = req.body;
+    // B3: the business date the transfer takes effect (default: business today).
+    const effective_date = req.body.effective_date || businessToday();
+    if (!isValidDateOnly(effective_date)) {
+        return res.status(400).json({ status: 'error', message: 'effective_date must be a valid date (YYYY-MM-DD).' });
+    }
     const current_shift_type = normalizeShift(req.body.current_shift_type);
     const target_shift_type = normalizeShift(req.body.target_shift_type);
     const requested_by_user_id = req.user.user_id;
@@ -54,10 +68,10 @@ exports.createTransferRequest = async (req, res) => {
             [result] = await db.query(
                 `INSERT INTO worker_transfer_requests
                  (worker_id, current_site_id, current_shift_type, target_site_id, target_shift_type,
-                  requested_by_user_id, status, admin_notes, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?, NOW(), NOW())`,
+                  requested_by_user_id, status, admin_notes, effective_date, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?, ?, NOW(), NOW())`,
                 [worker_id, current_site_id, current_shift_type, target_site_id, target_shift_type,
-                 requested_by_user_id, transfer_reason || null]
+                 requested_by_user_id, transfer_reason || null, effective_date]
             );
         } catch (insertError) {
             if (insertError.code === 'ER_DUP_ENTRY' || insertError.errno === 1062) {
@@ -133,6 +147,7 @@ exports.getPendingTransfers = async (req, res) => {
             `SELECT
                 t.request_id, t.status, t.admin_notes, t.created_at, t.document_path,
                 t.current_shift_type, t.target_shift_type,
+                DATE_FORMAT(t.effective_date, '%Y-%m-%d') AS effective_date,
                 w.worker_id, w.full_name AS worker_name,
                 cs.site_id AS current_site_id, cs.site_name AS current_site_name,
                 ts.site_id AS target_site_id, ts.site_name AS target_site_name,
@@ -177,34 +192,96 @@ exports.reviewTransferRequest = async (req, res) => {
             throw new Error('This request cannot be reviewed because it has already been processed.');
         }
 
+        let effectiveDate = null;
         if (status === 'Approved') {
-            await connection.execute(
-                `UPDATE workersiteassignments 
-                 SET unassigned_date = NOW(), updated_at = NOW() 
-                 WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND unassigned_date IS NULL`,
+            // B3: the assignment history uses the explicit business effective date,
+            // never the approval moment (NOW()/CURDATE()).
+            //   old assignment: unassigned_date = effective_date  (exclusive end -> last day = effective_date - 1)
+            //   new assignment: assigned_date   = effective_date
+            effectiveDate = req.body.effective_date || (request.effective_date ? String(request.effective_date).slice(0, 10) : null);
+            if (!effectiveDate || !isValidDateOnly(effectiveDate)) {
+                throw new TransferError('An effective_date (YYYY-MM-DD) is required to approve this transfer.');
+            }
+            if (effectiveDate > businessToday()) {
+                throw new TransferError('Future-dated transfers are not supported yet. Approve the request on or after its effective date.');
+            }
+
+            const [openAssignments] = await connection.execute(
+                `SELECT assignment_id, DATE_FORMAT(assigned_date, '%Y-%m-%d') AS assigned_date
+                 FROM workersiteassignments
+                 WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND unassigned_date IS NULL
+                 FOR UPDATE`,
                 [request.worker_id, request.current_site_id, request.current_shift_type]
+            );
+            if (openAssignments.length !== 1) {
+                throw new TransferError(openAssignments.length === 0
+                    ? 'The worker has no open assignment at the current site/shift.'
+                    : 'The worker has more than one open assignment at the current site/shift.', 409);
+            }
+            const oldAssignment = openAssignments[0];
+            if (effectiveDate <= oldAssignment.assigned_date) {
+                throw new TransferError(`effective_date must be after the current assignment start (${oldAssignment.assigned_date}).`, 409);
+            }
+
+            // A retroactive transfer must not leave attendance at the old site
+            // after the transfer took effect (that would be a conflicting history).
+            const [conflicts] = await connection.execute(
+                `SELECT attendance_id, DATE_FORMAT(record_date, '%Y-%m-%d') AS record_date, status, source
+                 FROM attendance
+                 WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND record_date >= ?
+                 ORDER BY record_date`,
+                [request.worker_id, request.current_site_id, request.current_shift_type, effectiveDate]
+            );
+            if (conflicts.length > 0) {
+                throw new TransferError(
+                    `The worker already has ${conflicts.length} attendance record(s) at the current site/shift on or after ${effectiveDate}. ` +
+                    'Choose a later effective date or correct those records first.', 409, { conflicts });
+            }
+
+            const [targetOpen] = await connection.execute(
+                `SELECT assignment_id FROM workersiteassignments
+                 WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND unassigned_date IS NULL LIMIT 1`,
+                [request.worker_id, request.target_site_id, request.target_shift_type]
+            );
+            if (targetOpen.length > 0) {
+                throw new TransferError('The worker already has an open assignment at the target site/shift.', 409);
+            }
+
+            await connection.execute(
+                `UPDATE workersiteassignments
+                 SET unassigned_date = ?, updated_at = NOW()
+                 WHERE assignment_id = ? AND unassigned_date IS NULL`,
+                [effectiveDate, oldAssignment.assignment_id]
             );
 
             const [targetSite] = await connection.execute(
                 `SELECT contract_id FROM sites WHERE site_id = ? LIMIT 1`,
                 [request.target_site_id]
             );
-            if (targetSite.length === 0) throw new Error('Target site does not exist.');
+            if (targetSite.length === 0) throw new TransferError('Target site does not exist.');
             const contract_id = targetSite[0].contract_id;
 
             await connection.execute(
                 `INSERT INTO workersiteassignments 
                  (worker_id, site_id, contract_id, assigned_by_user_id, assigned_date, shift_type, created_at, updated_at) 
-                 VALUES (?, ?, ?, ?, CURDATE(), ?, NOW(), NOW())`,
-                [request.worker_id, request.target_site_id, contract_id, adminId, request.target_shift_type]
+                 VALUES (?, ?, ?, ?, ?, ?, NOW(), NOW())`,
+                [request.worker_id, request.target_site_id, contract_id, adminId, effectiveDate, request.target_shift_type]
+            );
+
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('worker_transfer_requests', ?, 'TRANSFER_APPROVED', ?, ?, ?)`,
+                [request.request_id, adminId,
+                    JSON.stringify({ assignment_id: oldAssignment.assignment_id, site_id: request.current_site_id, shift_type: request.current_shift_type }),
+                    JSON.stringify({ site_id: request.target_site_id, shift_type: request.target_shift_type, effective_date: effectiveDate, approved_on: businessToday() })]
             );
         }
 
         await connection.execute(
             `UPDATE worker_transfer_requests 
-             SET status = ?, admin_notes = ?, updated_at = NOW() 
+             SET status = ?, admin_notes = ?, effective_date = COALESCE(?, effective_date), updated_at = NOW() 
              WHERE request_id = ?`,
-            [status, admin_notes || null, id]
+            [status, admin_notes || null, effectiveDate, id]
         );
 
         await connection.commit();
@@ -215,7 +292,11 @@ exports.reviewTransferRequest = async (req, res) => {
     } catch (error) {
         await connection.rollback();
         console.error('REVIEW TRANSFER ERROR:', error);
-        res.status(400).json({ status: 'error', message: error.message || 'An error occurred while processing the request.' });
+        res.status(error.statusCode || 400).json({
+            status: 'error',
+            message: error.message || 'An error occurred while processing the request.',
+            ...(error.extra || {}),
+        });
     } finally {
         connection.release();
     }

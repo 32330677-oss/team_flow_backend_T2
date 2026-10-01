@@ -1,6 +1,14 @@
 // backend/controllers/adminAttendanceController.js
 const db = require('../config/db');
 const settingsCache = require('../services/settingsCache');
+const { businessToday } = require('../services/businessDate');
+
+// Defaults used when a key was never stored (unchanged values).
+const DEFAULT_SETTING_VALUES = {
+    is_lunch_paid: 'false',
+    standard_work_minutes: '600',
+    overtime_flat_rate_syp: '150',
+};
 
 exports.getPendingRecords = async (req, res) => {
     try {
@@ -54,8 +62,9 @@ exports.reviewRecord = async (req, res) => {
         try {
             await connection.beginTransaction();
 
+            // #9: lock the row so two concurrent reviews cannot both succeed.
             const [oldRows] = await connection.execute(
-                'SELECT * FROM attendance WHERE attendance_id = ?', 
+                'SELECT * FROM attendance WHERE attendance_id = ? FOR UPDATE',
                 [attendance_id]
             );
             
@@ -69,15 +78,17 @@ exports.reviewRecord = async (req, res) => {
             if (oldRecord.status !== 'Submitted') {
                  throw new Error('Record cannot be reviewed as it is not in pending status.');
             }
-            if (status === 'Rejected' && oldRecord.source === 'Biometric') {
-                throw new Error('Biometric records cannot be rejected. Correct the times from the Biometric Processing page, then approve.');
-            }
-            await connection.execute(
+            // B6: biometric worker records can be rejected like manual ones (and like
+            // staff records). The supervisor resubmits them (#4 in resubmitAttendance).
+            const [reviewed] = await connection.execute(
                 `UPDATE attendance 
                  SET status = ?, admin_rejection_notes = ?, approved_by_user_id = ?, approval_date = NOW() 
-                 WHERE attendance_id = ?`,
+                 WHERE attendance_id = ? AND status = 'Submitted'`,
                 [status, (status === 'Rejected' ? admin_note : null), adminId, attendance_id]
             );
+            if (reviewed.affectedRows !== 1) {
+                throw new Error('Record cannot be reviewed as it is not in pending status.');
+            }
 
             await connection.execute(
                 `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values) 
@@ -97,7 +108,7 @@ exports.reviewRecord = async (req, res) => {
         } catch (error) {
             await connection.rollback();
             console.error("Review Transaction Error:", error);
-            res.status(error.message.includes('record') || error.message.includes('Status') || error.message.includes('Rejected') ? 400 : 500).json({ status: 'error', message: error.message });
+            res.status(error.message.includes('record') || error.message.includes('Record') || error.message.includes('Status') || error.message.includes('pending') || error.message.includes('Rejected') ? 400 : 500).json({ status: 'error', message: error.message });
         } finally {
             connection.release();
         }
@@ -130,12 +141,9 @@ exports.getBreakSettings = async (req, res) => {
     try {
         const [rows] = await db.execute(
             `SELECT setting_key, setting_value FROM system_settings
-             WHERE setting_key IN ('is_lunch_paid','standard_work_minutes')`
+             WHERE setting_key IN ('is_lunch_paid','standard_work_minutes','overtime_flat_rate_syp')`
         );
-        const data = {
-            is_lunch_paid: 'false',
-            standard_work_minutes: '600',
-        };
+        const data = { ...DEFAULT_SETTING_VALUES };
         rows.forEach(r => data[r.setting_key] = r.setting_value);
         res.status(200).json({ status: 'success', data });
     } catch (error) {
@@ -145,9 +153,13 @@ exports.getBreakSettings = async (req, res) => {
 
 // 5. Update break & work hours settings with Cache refresh, Audit Log, and Pending Records validation
 exports.updateBreakSettings = async (req, res) => {
-    const { is_lunch_paid, standard_work_minutes } = req.body;
+    const { is_lunch_paid, standard_work_minutes, overtime_flat_rate_syp } = req.body;
     const adminId = req.user.user_id;
     const numericMinutes = Number(standard_work_minutes);
+    const numericOtRate = Number(overtime_flat_rate_syp);
+    if (overtime_flat_rate_syp !== undefined && (!Number.isFinite(numericOtRate) || numericOtRate < 0)) {
+        return res.status(400).json({ status: 'error', message: 'overtime_flat_rate_syp must be a non-negative number.' });
+    }
     if (standard_work_minutes !== undefined && (!Number.isFinite(numericMinutes) || numericMinutes <= 0 || numericMinutes > 1440)) {
         return res.status(400).json({ status: 'error', message: 'standard_work_minutes must be between 1 and 1440.' });
     }
@@ -170,20 +182,36 @@ exports.updateBreakSettings = async (req, res) => {
             });
         }
 
-        const updates = { is_lunch_paid: is_lunch_paid === undefined ? undefined : String(is_lunch_paid), standard_work_minutes: standard_work_minutes === undefined ? undefined : String(numericMinutes) };
+        const updates = {
+            is_lunch_paid: is_lunch_paid === undefined ? undefined : String(is_lunch_paid),
+            standard_work_minutes: standard_work_minutes === undefined ? undefined : String(numericMinutes),
+            overtime_flat_rate_syp: overtime_flat_rate_syp === undefined ? undefined : String(numericOtRate),
+        };
+
+        // D3: every change is also stored with the date it takes effect, so
+        // older attendance/payroll keeps the value that applied on its own date.
+        // Retroactive changes are not supported (effective date = business today).
+        const effectiveFrom = businessToday();
 
         for (const [key, value] of Object.entries(updates)) {
             if (value === undefined) continue;
+            const [[currentRow]] = await connection.execute(
+                'SELECT setting_value FROM system_settings WHERE setting_key = ? FOR UPDATE', [key]);
+            const oldValue = currentRow ? currentRow.setting_value : DEFAULT_SETTING_VALUES[key];
             await connection.execute(
                 `INSERT INTO system_settings (setting_key, setting_value)
                  VALUES (?, ?)
                  ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
                 [key, String(value)]
             );
+            await settingsCache.recordSettingChange(connection, {
+                key, oldValue, newValue: value, effectiveFrom,
+                reason: req.body?.reason || null, userId: adminId,
+            });
             await connection.execute(
-                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, new_values)
-                 VALUES ('system_settings', 0, 'UPDATE_SETTING', ?, ?)`,
-                [adminId, JSON.stringify({ [key]: value })]
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('system_settings', 0, 'UPDATE_SETTING', ?, ?, ?)`,
+                [adminId, JSON.stringify({ [key]: oldValue }), JSON.stringify({ [key]: value, effective_from: effectiveFrom })]
             );
         }
 

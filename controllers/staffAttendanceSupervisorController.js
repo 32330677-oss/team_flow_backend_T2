@@ -6,6 +6,12 @@ const {
   calculateStaffShiftHours,
 } = require('../services/staffAttendanceService');
 const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
+const { getStaffCompensationForDate } = require('../services/staffCompensationService');
+const { businessToday } = require('../services/businessDate');
+
+// #2: compare two wall-clock values to the minute ('YYYY-MM-DD HH:MM').
+const sameMinute = (a, b) => Boolean(a && b) &&
+  String(a).replace('T', ' ').slice(0, 16) === String(b).replace('T', ' ').slice(0, 16);
 
 const ATTENDANCE_STATUSES = ['Present', 'Absent', 'Sick', 'Vacation', 'Holiday'];
 
@@ -54,7 +60,8 @@ exports.getDayView = async (req, res) => {
               sa.regular_hours, sa.overtime_hours, sa.lunch_deducted_hours,
               sa.lunch_start_time, sa.lunch_end_time,
               COALESCE(sa.standard_minutes_snapshot, ROUND(sm.standard_daily_hours * 60)) AS standard_minutes_snapshot,
-              sa.is_friday_worked, sa.status, sa.admin_rejection_notes
+              sa.is_friday_worked, sa.status, sa.admin_rejection_notes,
+              sa.source
        FROM staff_members sm
        LEFT JOIN staff_attendance sa ON sa.staff_id = sm.staff_id AND sa.record_date = ?
        WHERE sm.staff_id IN (${placeholders})
@@ -109,7 +116,7 @@ exports.bulkSetAttendance = async (req, res) => {
       message: 'A valid record_date (YYYY-MM-DD) is required.'
     });
   }
-const maxAllowed = new Date().toISOString().slice(0, 10);
+const maxAllowed = businessToday();   // B10: business date, not the UTC date
 
 if (record_date > maxAllowed) {
   return res.status(400).json({ status: 'error', message: 'Attendance date cannot be in the future.' });
@@ -268,7 +275,41 @@ if (record_date > maxAllowed) {
         continue;
       }
 
-      const standardHours = Number(staffRows[0].standard_daily_hours || 8);
+      // D3: standard hours that applied on record_date (history), not today's profile.
+      const compOnDate = await getStaffCompensationForDate(staffId, record_date, connection);
+      const standardHours = compOnDate ? compOnDate.standard_daily_hours : Number(staffRows[0].standard_daily_hours || 8);
+
+      /*
+       * Get the existing attendance row and lock it (moved up: #2/#3 need it
+       * before validating the entry). Old values are kept for change
+       * detection and for an accurate audit record.
+       */
+      const [existing] = await connection.execute(
+        `SELECT
+           staff_attendance_id,
+           attendance_status,
+           check_in_time,
+           check_out_time,
+           regular_hours,
+           overtime_hours,
+           lunch_deducted_hours,
+           lunch_start_time,
+           lunch_end_time,
+           is_friday_worked,
+           friday_confirmed_by_user_id,
+           recorded_by_user_id,
+           admin_rejection_notes,
+           standard_minutes_snapshot,
+           status,
+           source
+         FROM staff_attendance
+         WHERE staff_id = ? AND record_date = ?
+         LIMIT 1
+         FOR UPDATE`,
+        [staffId, record_date]
+      );
+      const existingRow = existing.length > 0 ? existing[0] : null;
+      const isBiometricRow = existingRow && existingRow.source === 'Biometric';
 
       let regularHours = 0;
       let overtimeHours = 0;
@@ -277,12 +318,48 @@ if (record_date > maxAllowed) {
       let checkOut = null;
       let lunchStart = null;
       let lunchEnd = null;
+      let rawCheckIn = null;
+      let rawCheckOut = null;
+      let biometricInOnlyDraft = false;
 
 if (status === 'Present') {
-  const rawCheckIn = formatToMySqlDateTime(entry.check_in_time);
-  const rawCheckOut = formatToMySqlDateTime(entry.check_out_time);
+  rawCheckIn = formatToMySqlDateTime(entry.check_in_time);
+  rawCheckOut = formatToMySqlDateTime(entry.check_out_time);
 
-  if (!rawCheckIn || !rawCheckOut) {
+  // #2: an unchanged biometric time (same minute) keeps the stored value
+  // exactly, seconds included. Only an explicit edit changes it.
+  if (isBiometricRow) {
+    if (sameMinute(rawCheckIn, existingRow.check_in_time)) rawCheckIn = String(existingRow.check_in_time).replace('T', ' ').slice(0, 19);
+    if (sameMinute(rawCheckOut, existingRow.check_out_time)) rawCheckOut = String(existingRow.check_out_time).replace('T', ' ').slice(0, 19);
+  }
+
+  // #3: in DRAFT mode only, a biometric record that has an IN and is still
+  // waiting for its OUT may be saved without a check-out (OUT stays NULL,
+  // hours stay empty). Submit still requires both times (checked below).
+  biometricInOnlyDraft = Boolean(isDraftMode && !rawCheckOut && rawCheckIn &&
+    isBiometricRow && existingRow.check_in_time && !existingRow.check_out_time);
+
+  if (biometricInOnlyDraft) {
+    if (rawCheckIn.slice(0, 10) !== record_date) {
+      results.skipped.push({ staff_id: staffId, reason: 'Check-in date must match the attendance date.' });
+      continue;
+    }
+    const rawLunchStart = entry.lunch_start_time ? formatToMySqlDateTime(entry.lunch_start_time) : null;
+    const rawLunchEnd = entry.lunch_end_time ? formatToMySqlDateTime(entry.lunch_end_time) : null;
+    if ((entry.lunch_start_time && !rawLunchStart) || (entry.lunch_end_time && !rawLunchEnd) ||
+        (Boolean(rawLunchStart) !== Boolean(rawLunchEnd)) ||
+        (rawLunchStart && (rawLunchEnd <= rawLunchStart || rawLunchStart < rawCheckIn))) {
+      results.skipped.push({ staff_id: staffId, reason: 'Invalid lunch start/end time.' });
+      continue;
+    }
+    checkIn = rawCheckIn;
+    checkOut = null;
+    lunchStart = rawLunchStart;
+    lunchEnd = rawLunchEnd;
+    regularHours = null;
+    overtimeHours = null;
+    lunchHours = 0;
+  } else if (!rawCheckIn || !rawCheckOut) {
     results.skipped.push({
       staff_id: staffId,
       reason:
@@ -290,6 +367,9 @@ if (status === 'Present') {
     });
     continue;
   }
+}
+
+if (status === 'Present' && !biometricInOnlyDraft) {
 
   // Check-in date must match the attendance record date.
   if (rawCheckIn.slice(0, 10) !== record_date) {
@@ -332,34 +412,6 @@ if (status === 'Present') {
         }
       }
 
-      /*
-       * Get the existing attendance row and lock it.
-       * Old values are kept for change detection and for an accurate audit record.
-       */
-      const [existing] = await connection.execute(
-        `SELECT
-           staff_attendance_id,
-           attendance_status,
-           check_in_time,
-           check_out_time,
-           regular_hours,
-           overtime_hours,
-           lunch_deducted_hours,
-           lunch_start_time,
-           lunch_end_time,
-           is_friday_worked,
-           friday_confirmed_by_user_id,
-           recorded_by_user_id,
-           admin_rejection_notes,
-           standard_minutes_snapshot,
-           status
-         FROM staff_attendance
-         WHERE staff_id = ? AND record_date = ?
-         LIMIT 1
-         FOR UPDATE`,
-        [staffId, record_date]
-      );
-
       const isFridayWorked =
         dayIsFriday && status === 'Present' && fridayConfirmed ? 1 : 0;
 
@@ -388,6 +440,7 @@ if (status === 'Present') {
           ? Number(existingRecord.standard_minutes_snapshot)
           : Math.round(standardHours * 60);
       if (status === 'Present' && checkIn && checkOut && existingRecord.standard_minutes_snapshot) {
+  // (IN-only biometric drafts keep their hours empty until the OUT exists.)
   const historicalShift = calculateStaffShiftHours({
     checkInRaw: checkIn,
     checkOutRaw: checkOut,
@@ -427,8 +480,8 @@ if (status === 'Present') {
           attendance_status: status,
           check_in_time: checkIn,
           check_out_time: checkOut,
-          regular_hours: Number(regularHours.toFixed(2)),
-          overtime_hours: Number(overtimeHours.toFixed(2)),
+          regular_hours: regularHours === null ? null : Number(regularHours.toFixed(2)),
+          overtime_hours: overtimeHours === null ? null : Number(overtimeHours.toFixed(2)),
           lunch_deducted_hours: Number(lunchHours.toFixed(2)),
           is_friday_worked: isFridayWorked,
           friday_confirmed_by_user_id: fridayConfirmedBy,
@@ -478,8 +531,8 @@ if (status === 'Present') {
             status,
             checkIn,
             checkOut,
-            regularHours.toFixed(2),
-            overtimeHours.toFixed(2),
+            regularHours === null ? null : regularHours.toFixed(2),
+            overtimeHours === null ? null : overtimeHours.toFixed(2),
             lunchHours.toFixed(2),
             isFridayWorked,
             fridayConfirmedBy,

@@ -139,6 +139,30 @@ async function listAvailableEntities(req, res) {
 
     let rows;
 
+    // D5: ?include_inactive=1 lists every person (any status, even if already
+    // mapped) so an Admin can create a CLOSED historical mapping for someone who
+    // is now inactive/terminated. The default list (open mappings) is unchanged.
+    const includeInactive = ['1', 'true'].includes(String(req.query.include_inactive || '').toLowerCase());
+    if (includeInactive) {
+      if (entityType === 'Worker') {
+        [rows] = await db.execute(
+          `SELECT w.worker_id, w.worker_unique_id, w.full_name, w.hire_date AS start_date,
+                  w.status, NULL AS termination_date
+           FROM workers w
+           ORDER BY w.status, w.full_name`
+        );
+      } else {
+        [rows] = await db.execute(
+          `SELECT sm.staff_id, sm.staff_unique_id, sm.full_name, sm.position,
+                  COALESCE(sm.first_hire_date, sm.hire_date) AS start_date,
+                  sm.status, sm.termination_date
+           FROM staff_members sm
+           ORDER BY sm.status, sm.full_name`
+        );
+      }
+      return res.status(200).json({ success: true, data: rows });
+    }
+
     if (entityType === 'Worker') {
       [rows] = await db.execute(
         `SELECT w.worker_id, w.worker_unique_id, w.full_name, w.hire_date AS start_date 

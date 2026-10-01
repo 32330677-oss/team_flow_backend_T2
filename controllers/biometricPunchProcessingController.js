@@ -1,6 +1,9 @@
 const db = require('../config/db');
 const { processPendingPunches } = require('../services/biometricPunchProcessor');
 
+const ALL_STATUSES = ['Pending', 'Processed', 'Skipped', 'NeedsReview', 'Invalid', 'Failed', 'Dismissed'];
+const ISSUE_STATUSES = ['NeedsReview', 'Failed', 'Invalid', 'Skipped', 'Dismissed'];
+
 function badRequest(message) {
   const error = new Error(message);
   error.statusCode = 400;
@@ -41,12 +44,14 @@ function sendError(res, error, fallbackMessage) {
 }
 
 // POST /api/biometric/processing/process
+// body: { limit?, retry_failed? }  (retry_skipped is accepted for old clients and ignored:
+// Skipped is now informational-only and never needs a retry)
 exports.processPunches = async (req, res) => {
   try {
     const body = req.body || {};
     const limit = parseIntegerParam(body.limit, 'limit', 1, 2000, 200);
     const retryFailed = parseBooleanParam(body.retry_failed, 'retry_failed', false);
-    const retrySkipped = parseBooleanParam(body.retry_skipped, 'retry_skipped', true);
+    parseBooleanParam(body.retry_skipped, 'retry_skipped', true);
 
     const userId = Number(req.user?.user_id);
     if (!Number.isInteger(userId) || userId <= 0) {
@@ -57,7 +62,6 @@ exports.processPunches = async (req, res) => {
       recordedByUserId: userId,
       limit,
       retryFailed,
-      retrySkipped,
     });
 
     return res.status(200).json({ status: 'success', data: summary });
@@ -75,11 +79,11 @@ exports.getProcessingStatus = async (req, res) => {
        GROUP BY processing_status`
     );
 
-    const counts = { Pending: 0, Processed: 0, Skipped: 0, Failed: 0 };
+    const counts = Object.fromEntries(ALL_STATUSES.map((s) => [s, 0]));
     for (const row of rows) {
       counts[row.processing_status] = Number(row.cnt);
     }
-    const total = counts.Pending + counts.Processed + counts.Skipped + counts.Failed;
+    const total = Object.values(counts).reduce((a, b) => a + b, 0);
 
     return res.status(200).json({ status: 'success', data: { ...counts, total } });
   } catch (error) {
@@ -87,15 +91,15 @@ exports.getProcessingStatus = async (req, res) => {
   }
 };
 
-// GET /api/biometric/processing/failed?limit=100&status=Failed|Skipped
+// GET /api/biometric/processing/failed?limit=100&status=NeedsReview|Failed|Invalid|Skipped|Dismissed
 exports.getFailedPunches = async (req, res) => {
   try {
     const limit = parseIntegerParam(req.query.limit, 'limit', 1, 500, 100);
 
-    let statuses = ['Failed', 'Skipped'];
+    let statuses = ['NeedsReview', 'Failed'];
     if (req.query.status !== undefined && req.query.status !== '') {
-      if (!['Failed', 'Skipped'].includes(req.query.status)) {
-        throw badRequest('status must be Failed or Skipped.');
+      if (!ISSUE_STATUSES.includes(req.query.status)) {
+        throw badRequest(`status must be one of: ${ISSUE_STATUSES.join(', ')}.`);
       }
       statuses = [req.query.status];
     }
@@ -106,7 +110,9 @@ exports.getFailedPunches = async (req, res) => {
       `SELECT p.id AS punch_id, p.batch_id, p.device_employee_id, p.punched_at,
               p.raw_punch_code, p.punch_type, p.line_number,
               pr.processing_status, pr.processing_result, pr.processing_error,
-              pr.attempts, pr.processed_at, pr.processed_by_user_id
+              pr.attempts, pr.processed_at, pr.processed_by_user_id,
+              pr.mapping_id, pr.target_table, pr.target_record_id,
+              pr.resolved_at, pr.resolved_by_user_id, pr.resolution_note
        FROM attendance_punch_processing pr
        JOIN attendance_punches p ON p.id = pr.punch_id
        WHERE pr.processing_status IN (${placeholders})
@@ -117,6 +123,6 @@ exports.getFailedPunches = async (req, res) => {
 
     return res.status(200).json({ status: 'success', results: rows.length, data: rows });
   } catch (error) {
-    return sendError(res, error, 'Failed to load failed/skipped punches.');
+    return sendError(res, error, 'Failed to load processing issues.');
   }
 };

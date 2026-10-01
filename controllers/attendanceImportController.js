@@ -90,6 +90,57 @@ exports.createBatch = async (req, res) => {
   }
 };
 
+// A3 + C5: a duplicate raw punch is never inserted twice, but it must not stay
+// unprocessable either:
+//   - C5: if the existing punch has no queue row, create it (Pending).
+//   - A3: if the existing punch belongs to a batch that never completed
+//     (Pending/Failed, i.e. abandoned), move it to the batch that is now
+//     delivering it. The raw row itself is unchanged except batch_id, and the
+//     move is audited. Nothing is deleted.
+// Returns true when the punch was recovered (re-pointed or queue row created).
+async function healDuplicatePunch(connection, dedupeKey, batchId) {
+  let changed = false;
+  try {
+    await connection.beginTransaction();
+    const [[punch]] = await connection.execute(
+      `SELECT p.id, p.batch_id, b.status AS batch_status
+       FROM attendance_punches p
+       JOIN attendance_import_batches b ON b.id = p.batch_id
+       WHERE p.dedupe_key = ? FOR UPDATE`,
+      [dedupeKey]
+    );
+    if (!punch) { await connection.rollback(); return false; }
+
+    if (punch.batch_id !== batchId && ['Pending', 'Failed'].includes(punch.batch_status)) {
+      const [moved] = await connection.execute(
+        'UPDATE attendance_punches SET batch_id = ? WHERE id = ? AND batch_id = ?',
+        [batchId, punch.id, punch.batch_id]
+      );
+      if (moved.affectedRows === 1) {
+        changed = true;
+        await connection.execute(
+          `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+           VALUES ('attendance_punches', ?, 'PUNCH_BATCH_REPOINTED', NULL, ?, ?)`,
+          [punch.id, JSON.stringify({ batch_id: punch.batch_id, batch_status: punch.batch_status }),
+            JSON.stringify({ batch_id: batchId })]
+        );
+      }
+    }
+
+    const [queued] = await connection.execute(
+      `INSERT IGNORE INTO attendance_punch_processing (punch_id, processing_status) VALUES (?, 'Pending')`,
+      [punch.id]
+    );
+    if (queued.affectedRows === 1) changed = true;
+
+    await connection.commit();
+    return changed;
+  } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
+    throw error;
+  }
+}
+
 exports.addPunches = async (req, res) => {
   const batchId = Number(req.body?.batchId);
   const punches = req.body?.punches;
@@ -105,10 +156,19 @@ exports.addPunches = async (req, res) => {
     if (['Completed', 'CompletedWithErrors'].includes(batches[0].status)) {
       return res.status(409).json({ status: 'error', message: 'This batch is already completed.' });
     }
+    // #8: a Failed batch never accepts punches (they would never be processed).
+    // The message is deliberately different from "already completed" so the
+    // connector moves the file to failed/ instead of processed/.
+    if (batches[0].status === 'Failed') {
+      return res.status(409).json({
+        status: 'error',
+        message: 'This batch has failed and cannot accept punches. Export the device file again.',
+      });
+    }
 
     connection = await db.getConnection();
 
-    let inserted = 0, duplicates = 0;
+    let inserted = 0, duplicates = 0, recovered = 0;
     const errors = [];
     for (let i = 0; i < punches.length; i += 1) {
       const { value, error } = validatePunch(punches[i]);
@@ -136,8 +196,10 @@ exports.addPunches = async (req, res) => {
       } catch (e) {
         try { await connection.rollback(); } catch (_) {}
         // UNIQUE(dedupe_key) on the RAW insert is the real duplicate guard.
-        if (e.code === 'ER_DUP_ENTRY' && !rawInserted) duplicates += 1;
-        else throw e;
+        if (e.code === 'ER_DUP_ENTRY' && !rawInserted) {
+          duplicates += 1;
+          if (await healDuplicatePunch(connection, value.dedupeKey, batchId)) recovered += 1;
+        } else throw e;
       }
     }
         if (errors.length > 0) {
@@ -145,7 +207,7 @@ exports.addPunches = async (req, res) => {
         'UPDATE attendance_import_batches SET error_rows = error_rows + ? WHERE id = ?',
         [errors.length, batchId]);
     }
-    return res.status(200).json({ status: 'success', inserted, duplicates, errors: errors.length, errorDetails: errors.slice(0, 20) });
+    return res.status(200).json({ status: 'success', inserted, duplicates, recovered, errors: errors.length, errorDetails: errors.slice(0, 20) });
   } catch (error) {
     console.error('ADD PUNCHES ERROR:', error);
     return res.status(500).json({ status: 'error', message: 'Failed to store punches.' });
@@ -165,42 +227,58 @@ exports.completeBatch = async (req, res) => {
   }
   const errorDetails = Array.isArray(req.body?.errors) ? req.body.errors.slice(0, 50) : [];
 
+  // B9: check + update happen in ONE transaction on a locked row, and the
+  // UPDATE is guarded by status = 'Pending' (no double completion).
+  const connection = await db.getConnection();
   try {
-    const [found] = await db.execute(
-      'SELECT id, status, error_rows FROM attendance_import_batches WHERE id = ?', [batchId]);
-    if (!found.length) return res.status(404).json({ status: 'error', message: 'Batch not found.' });
+    await connection.beginTransaction();
+    const [found] = await connection.execute(
+      'SELECT id, status, error_rows FROM attendance_import_batches WHERE id = ? FOR UPDATE', [batchId]);
+    if (!found.length) {
+      await connection.rollback();
+      return res.status(404).json({ status: 'error', message: 'Batch not found.' });
+    }
     const batch = found[0];
 
     // Idempotent: a completed batch is never recomputed.
     if (['Completed', 'CompletedWithErrors', 'Failed'].includes(batch.status)) {
+      await connection.rollback();
       return res.status(200).json({ status: 'success', batchStatus: batch.status, alreadyCompleted: true });
     }
 
     const serverRejected = Number(batch.error_rows || 0);   // rejected by validatePunch during upload
-    const [[cnt]] = await db.execute(
-      'SELECT COUNT(*) AS c FROM attendance_punches WHERE batch_id = ?', [batchId]).then(([r]) => [r]);
+    const [[cnt]] = await connection.execute(
+      'SELECT COUNT(*) AS c FROM attendance_punches WHERE batch_id = ?', [batchId]);
     const inserted = Number(cnt.c);
     const duplicates = Math.max(0, validRows - serverRejected - inserted);
     const totalErrors = errorRows + serverRejected;
     const status = validRows === 0 ? 'Failed' : (totalErrors > 0 ? 'CompletedWithErrors' : 'Completed');
 
-    await db.execute(
+    const [updated] = await connection.execute(
       `UPDATE attendance_import_batches
        SET status = ?, total_rows = ?, inserted_rows = ?, duplicate_rows = ?, error_rows = ?,
            error_details = ?, imported_at = NOW()
-       WHERE id = ?`,
+       WHERE id = ? AND status = 'Pending'`,
       [status, totalRows, inserted, duplicates, totalErrors,
         JSON.stringify({ parse_errors: errorDetails, server_rejected: serverRejected }), batchId]);
+    if (updated.affectedRows !== 1) {
+      await connection.rollback();
+      return res.status(200).json({ status: 'success', batchStatus: batch.status, alreadyCompleted: true });
+    }
 
-    await db.execute(
+    await connection.execute(
       `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
        VALUES ('attendance_import_batches', ?, 'BIOMETRIC_IMPORT_COMPLETED', NULL, NULL, ?)`,
       [batchId, JSON.stringify({ status, totalRows, inserted, duplicates, totalErrors })]);
 
+    await connection.commit();
     return res.status(200).json({ status: 'success', batchStatus: status, total: totalRows, inserted, duplicates, errors: totalErrors });
   } catch (error) {
+    try { await connection.rollback(); } catch (_) {}
     console.error('COMPLETE IMPORT BATCH ERROR:', error);
     return res.status(500).json({ status: 'error', message: 'Failed to complete import batch.' });
+  } finally {
+    connection.release();
   }
 };
 
@@ -226,23 +304,33 @@ exports.getBatch = async (req, res) => {
   }
 };
 
+// C4: every punch with no covering active mapping on its own date is listed.
+// (The old NOT EXISTS clause hid device IDs that had ANY open mapping, even
+// when that mapping started after the punch.) Optional ?date=YYYY-MM-DD.
 exports.getUnmappedDeviceIds = async (req, res) => {
+  const date = req.query?.date;
+  if (date !== undefined && date !== '' && !/^\d{4}-\d{2}-\d{2}$/.test(String(date))) {
+    return res.status(400).json({ status: 'error', message: 'date must be YYYY-MM-DD.' });
+  }
   try {
+    const params = [];
+    let dateFilter = '';
+    if (date) {
+      dateFilter = ' AND p.punched_at >= ? AND p.punched_at < DATE_ADD(?, INTERVAL 1 DAY)';
+      params.push(`${date} 00:00:00`, date);
+    }
     const [rows] = await db.execute(
       `SELECT p.device_employee_id, COUNT(*) AS punches,
               MIN(p.punched_at) AS first_punch, MAX(p.punched_at) AS last_punch
        FROM attendance_punches p
-       LEFT JOIN attendance_device_users u
-         ON u.device_employee_id = p.device_employee_id AND u.active = 1
-        AND DATE(p.punched_at) >= u.effective_from
-        AND (u.effective_to IS NULL OR DATE(p.punched_at) <= u.effective_to)
-       WHERE u.id IS NULL
-         AND NOT EXISTS (
-           SELECT 1 FROM attendance_device_users o
-           WHERE o.device_employee_id = p.device_employee_id
-             AND o.active = 1 AND o.effective_to IS NULL)
+       WHERE NOT EXISTS (
+           SELECT 1 FROM attendance_device_users u
+           WHERE u.device_employee_id = p.device_employee_id AND u.active = 1
+             AND u.effective_from <= DATE(p.punched_at)
+             AND (u.effective_to IS NULL OR DATE(p.punched_at) <= u.effective_to))${dateFilter}
        GROUP BY p.device_employee_id
-       ORDER BY last_punch DESC`);
+       ORDER BY last_punch DESC`,
+      params);
     return res.status(200).json({ status: 'success', data: rows });
   } catch (error) {
     console.error('GET UNMAPPED DEVICE IDS ERROR:', error);
