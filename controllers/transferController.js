@@ -202,9 +202,9 @@ exports.reviewTransferRequest = async (req, res) => {
             if (!effectiveDate || !isValidDateOnly(effectiveDate)) {
                 throw new TransferError('An effective_date (YYYY-MM-DD) is required to approve this transfer.');
             }
-            if (effectiveDate > businessToday()) {
-                throw new TransferError('Future-dated transfers are not supported yet. Approve the request on or after its effective date.');
-            }
+            // B3 (final decision): future-dated transfers are allowed. The open
+            // (unassigned_date IS NULL) current assignment is closed at the future
+            // effective date (exclusive end) and the new one starts on that date.
 
             const [openAssignments] = await connection.execute(
                 `SELECT assignment_id, DATE_FORMAT(assigned_date, '%Y-%m-%d') AS assigned_date
@@ -238,13 +238,23 @@ exports.reviewTransferRequest = async (req, res) => {
                     'Choose a later effective date or correct those records first.', 409, { conflicts });
             }
 
+            // Conflicting assignment history at the target: an open assignment, or a
+            // closed one that is still in effect on/after effective_date (exclusive end).
             const [targetOpen] = await connection.execute(
-                `SELECT assignment_id FROM workersiteassignments
-                 WHERE worker_id = ? AND site_id = ? AND shift_type = ? AND unassigned_date IS NULL LIMIT 1`,
-                [request.worker_id, request.target_site_id, request.target_shift_type]
+                `SELECT assignment_id,
+                        DATE_FORMAT(assigned_date, '%Y-%m-%d') AS assigned_date,
+                        DATE_FORMAT(unassigned_date, '%Y-%m-%d') AS unassigned_date
+                 FROM workersiteassignments
+                 WHERE worker_id = ? AND site_id = ? AND shift_type = ?
+                   AND (unassigned_date IS NULL OR unassigned_date > ?)`,
+                [request.worker_id, request.target_site_id, request.target_shift_type, effectiveDate]
             );
             if (targetOpen.length > 0) {
-                throw new TransferError('The worker already has an open assignment at the target site/shift.', 409);
+                const hasOpen = targetOpen.some((a) => a.unassigned_date === null);
+                throw new TransferError(hasOpen
+                    ? 'The worker already has an open assignment at the target site/shift.'
+                    : `The worker already has an assignment at the target site/shift that overlaps ${effectiveDate}.`,
+                    409, { assignment_conflicts: targetOpen });
             }
 
             await connection.execute(

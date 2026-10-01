@@ -65,6 +65,20 @@ async function getSettingForDate(key, date, fallback) {
     return cache[key] !== undefined ? cache[key] : fallback;
 }
 
+/**
+ * D3 (final decision): the value of an EXPLICIT dated change covering the date,
+ * or null. The automatic legacy row (effective_from = LEGACY_START, the value
+ * that was current before dated history existed) is not explicit history.
+ */
+async function getExplicitSettingForDate(key, date) {
+    if (!cache) await refresh();
+    const day = date ? String(date).slice(0, 10) : null;
+    if (!day || !historyCache) return null;
+    const row = historyCache.find((h) =>
+        h.key === key && h.from !== LEGACY_START && h.from <= day && (!h.to || h.to >= day));
+    return row ? row.value : null;
+}
+
 // تحديث الـ Cache فوراً بعد أي تعديل من الأدمن
 async function refresh() {
     if (isLoading) return isLoading;
@@ -135,4 +149,4 @@ async function recordSettingChange(executor, { key, oldValue, newValue, effectiv
     );
 }
 
-module.exports = { getSetting, getSettingForDate, refresh, recordSettingChange, LEGACY_START };
+module.exports = { getSetting, getSettingForDate, getExplicitSettingForDate, refresh, recordSettingChange, LEGACY_START };

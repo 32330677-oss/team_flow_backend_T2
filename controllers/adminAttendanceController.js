@@ -10,8 +10,25 @@ const DEFAULT_SETTING_VALUES = {
     overtime_flat_rate_syp: '150',
 };
 
+// #10: Supervisor reads of worker attendance are limited to the site/shift
+// scope they supervise. Same predicate as attendanceController.getRejectedRecords
+// and verifySupervisorSite: site_shifts for shift sites, sites.supervisor_id
+// only for sites that do not support shifts. Admin is never scoped.
+function supervisorScope(req) {
+    if (req.user && req.user.role === 'Supervisor') {
+        return {
+            join: ' LEFT JOIN site_shifts ss ON ss.site_id = a.site_id AND ss.shift_type = a.shift_type',
+            where: ` AND ((s.supports_shifts = 0 AND s.supervisor_id = ?)
+                       OR (s.supports_shifts = 1 AND ss.supervisor_id = ?))`,
+            params: [req.user.user_id, req.user.user_id],
+        };
+    }
+    return { join: '', where: '', params: [] };
+}
+
 exports.getPendingRecords = async (req, res) => {
     try {
+        const scope = supervisorScope(req);
         const [rows] = await db.execute(
             `SELECT a.attendance_id, a.worker_id, a.site_id, a.shift_type,
                     a.source,
@@ -24,8 +41,9 @@ exports.getPendingRecords = async (req, res) => {
                     w.full_name, s.site_name 
              FROM attendance a
              JOIN workers w ON a.worker_id = w.worker_id
-             JOIN sites s ON a.site_id = s.site_id
-             WHERE a.status IN ('Submitted', 'Rejected')`
+             JOIN sites s ON a.site_id = s.site_id${scope.join}
+             WHERE a.status IN ('Submitted', 'Rejected')${scope.where}`,
+            scope.params
         );
         res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
@@ -122,13 +140,14 @@ exports.reviewRecord = async (req, res) => {
 exports.getRecordsByDate = async (req, res) => {
     const { date } = req.query;
     try {
+        const scope = supervisorScope(req);
         const [rows] = await db.execute(
            `SELECT a.*, DATE_FORMAT(a.record_date, '%Y-%m-%d') as record_date, w.full_name, s.site_name 
             FROM attendance a
             JOIN workers w ON a.worker_id = w.worker_id
-            JOIN sites s ON a.site_id = s.site_id
-            WHERE DATE(a.record_date) = ? AND (a.status IN ('Submitted', 'Rejected'))`,
-            [date]
+            JOIN sites s ON a.site_id = s.site_id${scope.join}
+            WHERE DATE(a.record_date) = ? AND (a.status IN ('Submitted', 'Rejected'))${scope.where}`,
+            [date, ...scope.params]
         );
         res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
