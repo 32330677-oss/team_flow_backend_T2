@@ -112,6 +112,7 @@ let attSql = `
   SELECT a.attendance_id, a.worker_id, w.full_name AS worker_name, w.payment_type,
          a.record_date, a.site_id, a.shift_type, a.total_working_hours, a.overtime_hours,
          a.attendance_status, a.standard_minutes_snapshot,
+         w.standard_daily_minutes AS worker_custom_minutes,
          (
            SELECT wsa2.contract_id
            FROM workersiteassignments wsa2
@@ -230,9 +231,18 @@ let attSql = `
         if (nonWorkingStatus && !hasManagementHours) {
           dayFraction = 0;
         } else {
-          const standardMinutes = Number(rec.standard_minutes_snapshot) > 0
-            ? Number(rec.standard_minutes_snapshot)
-            : await fallbackStandardMinutesFor(recordDateStr);
+          // D3 (final decision): explicit settings history -> the record's
+          // snapshot -> legacy/current value. The global setting history only
+          // applies to workers without their own standard_daily_minutes; for
+          // those, the snapshot is the only historical record of their value.
+          const hasCustomMinutes = Number(rec.worker_custom_minutes) > 0;
+          const explicitMinutes = hasCustomMinutes ? null
+            : Number(await settingsCache.getExplicitSettingForDate('standard_work_minutes', recordDateStr));
+          const standardMinutes = explicitMinutes > 0
+            ? explicitMinutes
+            : Number(rec.standard_minutes_snapshot) > 0
+              ? Number(rec.standard_minutes_snapshot)
+              : await fallbackStandardMinutesFor(recordDateStr);
 
           const standardHours = standardMinutes / 60;
 
