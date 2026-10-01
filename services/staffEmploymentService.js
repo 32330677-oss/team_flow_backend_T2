@@ -8,6 +8,7 @@
 // onward (therefore the active span ends on D - 1).
 
 const db = require('../config/db');
+const { businessToday } = require('./businessDate');
 
 function toDateOnly(value) {
     if (!value) return null;
@@ -104,7 +105,8 @@ async function getActiveSpans(staffId, executor = db) {
 async function getActiveSpansOverlapping(staffId, periodStart, periodEnd, executor = db) {
     if (!isValidDateOnly(periodStart) || !isValidDateOnly(periodEnd) || periodStart > periodEnd) return [];
 
-    const todayStr = new Date().toISOString().slice(0, 10);
+    // B10: business date (Asia/Beirut), not the UTC date.
+    const todayStr = businessToday();
     const clampedPeriodEnd = periodEnd > todayStr ? todayStr : periodEnd;
     if (periodStart > clampedPeriodEnd) return [];
 

@@ -25,4 +25,9 @@ router.get('/admin/absences', restrictTo('Admin'), staffAbsenceController.getAbs
 router.post('/admin/absences/mark-paid', restrictTo('Admin'), staffAbsenceController.markAbsencesPaid);
 router.post('/admin/absences/unmark-paid', restrictTo('Admin'), staffAbsenceController.unmarkAbsencePaid);
 
+// ==================== B4: Lunch for biometric staff records (Admin) ====================
+const staffLunchAdminController = require('../controllers/staffLunchAdminController');
+router.get('/admin/lunch', restrictTo('Admin'), staffLunchAdminController.getLunchDay);
+router.post('/admin/lunch/apply', restrictTo('Admin'), staffLunchAdminController.applyLunch);
+
 module.exports = router;

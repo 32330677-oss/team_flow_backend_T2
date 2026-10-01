@@ -1601,7 +1601,9 @@ exports.setManagementLeaveHours = async (req, res) => {
             if (oldRecord.standard_minutes_snapshot !== null && oldRecord.standard_minutes_snapshot !== undefined) {
                 standardMinutes = Number(oldRecord.standard_minutes_snapshot);
             } else {
-                const configured = Number(await settingsCache.getSetting('standard_work_minutes', '600'));
+                // D3: value in effect on the record's own date.
+                const configured = Number(await settingsCache.getSettingForDate(
+                    'standard_work_minutes', String(oldRecord.record_date).slice(0, 10), '600'));
                 standardMinutes = Number.isFinite(configured) && configured > 0 ? configured : 600;
             }
 
@@ -1670,8 +1672,14 @@ exports.resubmitAttendance = async (req, res) => {
     const connection = await db.getConnection();
     try {
         await connection.beginTransaction();
+        // #4: biometric records are recorded by the Admin who ran processing, so the
+        // ownership check cannot apply to them. The site/shift scope check below
+        // (verifySiteAction) still restricts who may resubmit.
         const [records] = await connection.execute(
-            "SELECT * FROM attendance WHERE attendance_id = ? AND status = 'Rejected' AND recorded_by_user_id = ? FOR UPDATE",
+            `SELECT * FROM attendance
+             WHERE attendance_id = ? AND status = 'Rejected'
+               AND (recorded_by_user_id = ? OR source = 'Biometric')
+             FOR UPDATE`,
             [attendance_id, supervisor_id]
         );
 
@@ -1759,3 +1767,7 @@ exports.resubmitAttendance = async (req, res) => {
         connection.release();
     }
 };
+
+// Shared, unchanged helpers (used by the D2 admin "Submit for review" path so
+// it applies exactly the same lunch rules as submitDay).
+exports._shared = { normalizeTimeForShift, parseAttendanceDate, formatToMySqlDateTime };

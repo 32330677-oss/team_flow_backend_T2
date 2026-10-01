@@ -2,6 +2,8 @@ const db = require('../config/db');
 const multer = require('multer');
 const path = require('path');
 const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
+const { businessToday, addDays, isValidDateOnly, toDateOnly } = require('../services/businessDate');
+const { getLastStatusChange, recordWorkerStatusChange } = require('../services/workerStatusService');
 
 const storage = multer.diskStorage({
     destination: (req, file, cb) => cb(null, 'uploads/'),
@@ -146,7 +148,10 @@ exports.bulkUpdateCompensation = async (req, res) => {
     }
 
     const comp = normalizedCompensationValues(payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate);
-    const effectiveDate = effective_from || new Date().toISOString().split('T')[0];
+    const effectiveDate = effective_from || businessToday();   // B10: business date
+    if (!isValidDateOnly(effectiveDate)) {
+        return res.status(400).json({ status: 'error', message: 'effective_from must be a valid date (YYYY-MM-DD).' });
+    }
 
     const connection = await db.getConnection();
     const results = { updated: [], skipped: [] };
@@ -190,16 +195,15 @@ exports.bulkUpdateCompensation = async (req, res) => {
 
             if (activeCompRows.length > 0) {
                 const activeComp = activeCompRows[0];
-                if (effectiveDate <= activeComp.effective_from) {
+                if (effectiveDate <= toDateOnly(activeComp.effective_from)) {
                     // تخطي هذا العامل بدل ما توقف كل العملية
                     results.skipped.push(worker.worker_unique_id);
                     continue;
                 }
-                const closeDate = new Date(effectiveDate);
-                closeDate.setDate(closeDate.getDate() - 1);
+                // #15: pure date-string arithmetic (no local-timezone Date shift).
                 await connection.execute(
                     `UPDATE workercompensationhistory SET effective_to = ? WHERE compensation_id = ?`,
-                    [closeDate.toISOString().split('T')[0], activeComp.compensation_id]
+                    [addDays(effectiveDate, -1), activeComp.compensation_id]
                 );
             }
 
@@ -273,7 +277,7 @@ exports.createWorker = async (req, res) => {
     const comp = normalizedCompensationValues(payment_type, daily_rate, regular_hourly_rate, overtime_hourly_rate);
     const personalPhotoPath = req.files && req.files['personal_photo'] ? req.files['personal_photo'][0].path : null;
     const idPhotoPath = req.files && req.files['id_photo'] ? req.files['id_photo'][0].path : null;
-    const effectiveHireDate = hire_date || new Date().toISOString().split('T')[0];
+    const effectiveHireDate = hire_date || businessToday();   // B10: business date
 
     const connection = await db.getConnection();
     const lockKey = `create_worker:${full_name}:${phone_number || ''}`;
@@ -439,7 +443,11 @@ const touchesCompensation =
                     overtime_hourly_rate !== undefined ? overtime_hourly_rate : existing.overtime_hourly_rate
                 );
 
-                const effectiveDate = effective_from || new Date().toISOString().split('T')[0];
+                const effectiveDate = effective_from || businessToday();   // B10: business date
+                if (!isValidDateOnly(effectiveDate)) {
+                    await connection.rollback();
+                    return res.status(400).json({ status: 'error', message: 'effective_from must be a valid date (YYYY-MM-DD).' });
+                }
 
                 // Section 19: lock current active compensation row, close it, open a new one
                 const [activeCompRows] = await connection.execute(
@@ -451,16 +459,15 @@ const touchesCompensation =
 
                 if (activeCompRows.length > 0) {
                     const activeComp = activeCompRows[0];
-                    if (effectiveDate <= activeComp.effective_from) {
+                    if (effectiveDate <= toDateOnly(activeComp.effective_from)) {
                         await connection.rollback();
                         return res.status(400).json({
                             status: 'error',
                             message: 'The new effective date must be after the current compensation period start date.'
                         });
                     }
-                    const closeDate = new Date(effectiveDate);
-                    closeDate.setDate(closeDate.getDate() - 1);
-                    const closeDateStr = closeDate.toISOString().split('T')[0];
+                    // #15: pure date-string arithmetic (no local-timezone Date shift).
+                    const closeDateStr = addDays(effectiveDate, -1);
 
                     await connection.execute(
                         `UPDATE workercompensationhistory SET effective_to = ? WHERE compensation_id = ?`,
@@ -489,6 +496,50 @@ const touchesCompensation =
                         }),
                         JSON.stringify({ job_position: newJobPosition, payment_type: newPaymentType, ...newComp, reason })
                     ]
+                );
+            }
+
+            // D1: every status change is recorded in worker_status_history with the
+            // date it takes effect, so historical dates never depend on the
+            // CURRENT workers.status.
+            if (status !== undefined && status !== null && status !== '' && status !== existing.status) {
+                if (!['Active', 'Inactive'].includes(status)) {
+                    await connection.rollback();
+                    return res.status(400).json({ status: 'error', message: 'status must be Active or Inactive.' });
+                }
+                const statusEffectiveDate = req.body.status_effective_date || businessToday();
+                if (!isValidDateOnly(statusEffectiveDate)) {
+                    await connection.rollback();
+                    return res.status(400).json({ status: 'error', message: 'status_effective_date must be a valid date (YYYY-MM-DD).' });
+                }
+                if (statusEffectiveDate > businessToday()) {
+                    await connection.rollback();
+                    return res.status(400).json({ status: 'error', message: 'A status change cannot take effect in the future.' });
+                }
+                const hireDate = toDateOnly(existing.hire_date);
+                if (hireDate && statusEffectiveDate < hireDate) {
+                    await connection.rollback();
+                    return res.status(400).json({ status: 'error', message: `status_effective_date cannot be before the hire date (${hireDate}).` });
+                }
+                const last = await getLastStatusChange(existing.worker_id, connection);
+                if (last && statusEffectiveDate < toDateOnly(last.effective_date)) {
+                    await connection.rollback();
+                    return res.status(400).json({ status: 'error', message: `status_effective_date cannot be before the last recorded status change (${toDateOnly(last.effective_date)}).` });
+                }
+                const statusReason = req.body.status_reason ? String(req.body.status_reason).trim().slice(0, 500) : null;
+                await recordWorkerStatusChange(connection, {
+                    workerId: existing.worker_id,
+                    oldStatus: existing.status,
+                    newStatus: status,
+                    effectiveDate: statusEffectiveDate,
+                    reason: statusReason,
+                    userId: req.user.user_id,
+                });
+                await connection.execute(
+                    `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                     VALUES ('workers', ?, 'STATUS_CHANGED', ?, ?, ?)`,
+                    [existing.worker_id, req.user.user_id, JSON.stringify({ status: existing.status }),
+                        JSON.stringify({ status, effective_date: statusEffectiveDate, reason: statusReason })]
                 );
             }
 
@@ -570,5 +621,29 @@ exports.getCompensationHistory = async (req, res) => {
     } catch (error) {
         console.error("🚨 FETCH COMPENSATION HISTORY ERROR:", error);
         return res.status(500).json({ status: 'error', message: 'Failed to load compensation history' });
+    }
+};
+
+// D1: GET /api/workers/:id/status-history  (worker_id, numeric)
+exports.getStatusHistory = async (req, res) => {
+    try {
+        const workerId = Number(req.params.id);
+        if (!Number.isInteger(workerId) || workerId <= 0) {
+            return res.status(400).json({ status: 'error', message: 'Invalid worker id.' });
+        }
+        const [rows] = await db.execute(
+            `SELECT wsh.status_history_id, wsh.old_status, wsh.new_status,
+                    DATE_FORMAT(wsh.effective_date, '%Y-%m-%d') AS effective_date,
+                    wsh.reason, wsh.created_at, u.full_name AS changed_by_name
+             FROM worker_status_history wsh
+             LEFT JOIN users u ON u.user_id = wsh.changed_by_user_id
+             WHERE wsh.worker_id = ?
+             ORDER BY wsh.effective_date DESC, wsh.status_history_id DESC`,
+            [workerId]
+        );
+        return res.status(200).json({ status: 'success', data: rows });
+    } catch (error) {
+        console.error('FETCH WORKER STATUS HISTORY ERROR:', error);
+        return res.status(500).json({ status: 'error', message: 'Failed to load status history' });
     }
 };

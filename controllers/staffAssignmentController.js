@@ -11,6 +11,7 @@
 //   router.delete('/:id/assignments/current', restrictTo('Admin'), staffAssignmentController.unassignCurrent);
 
 const db = require('../config/db');
+const { businessToday } = require('../services/businessDate');
 
 function isValidDateOnly(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
@@ -58,7 +59,7 @@ exports.assignToSite = async (req, res) => {
   if (!site_id) {
     return res.status(400).json({ status: 'error', message: 'site_id is required.' });
   }
-  const effectiveDate = isValidDateOnly(assigned_date) ? assigned_date : new Date().toISOString().slice(0, 10);
+  const effectiveDate = isValidDateOnly(assigned_date) ? assigned_date : businessToday();   // B10
 
   const connection = await db.getConnection();
   try {
@@ -130,7 +131,7 @@ exports.unassignCurrent = async (req, res) => {
   if (!Number.isInteger(staffId) || staffId <= 0) {
     return res.status(400).json({ status: 'error', message: 'Invalid staff id.' });
   }
-  const effectiveDate = isValidDateOnly(unassigned_date) ? unassigned_date : new Date().toISOString().slice(0, 10);
+  const effectiveDate = isValidDateOnly(unassigned_date) ? unassigned_date : businessToday();   // B10
 
   const connection = await db.getConnection();
   try {

@@ -6,6 +6,7 @@
 // the "don't merge staff and worker logic" precedent already in this codebase.
 
 const db = require('../config/db');
+const { businessToday } = require('../services/businessDate');
 
 function isValidDateOnly(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
@@ -51,7 +52,7 @@ exports.assignSupervisor = async (req, res) => {
   if (!Number.isInteger(supervisorId) || supervisorId <= 0) {
     return res.status(400).json({ status: 'error', message: 'supervisor_user_id is required.' });
   }
-  const effectiveDate = isValidDateOnly(assigned_date) ? assigned_date : new Date().toISOString().slice(0, 10);
+  const effectiveDate = isValidDateOnly(assigned_date) ? assigned_date : businessToday();   // B10
 
   const connection = await db.getConnection();
   try {
@@ -129,7 +130,7 @@ exports.unassignCurrent = async (req, res) => {
   if (!Number.isInteger(staffId) || staffId <= 0) {
     return res.status(400).json({ status: 'error', message: 'Invalid staff id.' });
   }
-  const effectiveDate = isValidDateOnly(unassigned_date) ? unassigned_date : new Date().toISOString().slice(0, 10);
+  const effectiveDate = isValidDateOnly(unassigned_date) ? unassigned_date : businessToday();   // B10
 
   const connection = await db.getConnection();
   try {
@@ -178,7 +179,7 @@ exports.bulkAssignSupervisor = async (req, res) => {
   if (!Number.isInteger(supervisorId) || supervisorId <= 0) {
     return res.status(400).json({ status: 'error', message: 'supervisor_user_id is required.' });
   }
-  const effectiveDate = isValidDateOnly(assigned_date) ? assigned_date : new Date().toISOString().slice(0, 10);
+  const effectiveDate = isValidDateOnly(assigned_date) ? assigned_date : businessToday();   // B10
 
   const uniqueStaffIds = [...new Set(staff_ids.map(Number))].filter((id) => Number.isInteger(id) && id > 0);
   if (uniqueStaffIds.length === 0) {
@@ -263,13 +264,15 @@ exports.bulkAssignSupervisor = async (req, res) => {
   }
 };
 // Shared helper — used by staffAttendanceController.js for scope filtering.
+// B10: "today" is the business date (Asia/Beirut), not the DB server's CURDATE().
 exports.getAssignedStaffIdsForSupervisor = async (supervisorUserId, executor = db) => {
+  const today = businessToday();
   const [rows] = await executor.execute(
    `SELECT staff_id FROM staff_supervisor_assignments
  WHERE supervisor_user_id = ?
-   AND assigned_date <= CURDATE()
-   AND (unassigned_date IS NULL OR unassigned_date > CURDATE())`,
-    [supervisorUserId]
+   AND assigned_date <= ?
+   AND (unassigned_date IS NULL OR unassigned_date > ?)`,
+    [supervisorUserId, today, today]
   );
   return rows.map((r) => r.staff_id);
 };
@@ -285,11 +288,11 @@ exports.getMyAssignedStaff = async (req, res) => {
        FROM staff_supervisor_assignments ssa
        JOIN staff_members sm ON sm.staff_id = ssa.staff_id
        WHERE ssa.supervisor_user_id = ?
-         AND ssa.assigned_date <= CURDATE()
-         AND (ssa.unassigned_date IS NULL OR ssa.unassigned_date > CURDATE())
+         AND ssa.assigned_date <= ?
+         AND (ssa.unassigned_date IS NULL OR ssa.unassigned_date > ?)
          AND sm.status = 'Active'
        ORDER BY sm.full_name`,
-      [supervisorId]
+      [supervisorId, businessToday(), businessToday()]
     );
     return res.status(200).json({ status: 'success', data: rows });
   } catch (error) {

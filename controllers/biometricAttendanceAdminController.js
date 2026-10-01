@@ -1,6 +1,8 @@
 const db = require('../config/db');
 const attendanceService = require('../services/attendanceService');
 const { calculateStaffShiftHours, isValidDateOnly } = require('../services/staffAttendanceService');
+const { getStaffCompensationForDate } = require('../services/staffCompensationService');
+const { businessToday } = require('../services/businessDate');
 
 class OpError extends Error {
   constructor(message, statusCode = 400) {
@@ -31,7 +33,7 @@ function sendError(res, error, fallback) {
 
 // GET /api/biometric/attendance?date=YYYY-MM-DD
 exports.listByDate = async (req, res) => {
-  const date = req.query.date || new Date().toISOString().slice(0, 10);
+  const date = req.query.date || businessToday();   // B10: business date
   if (!isValidDateOnly(date)) {
     return res.status(400).json({ status: 'error', message: 'A valid date (YYYY-MM-DD) is required.' });
   }
@@ -39,7 +41,7 @@ exports.listByDate = async (req, res) => {
     const [workers] = await db.execute(
       `SELECT a.attendance_id, w.worker_unique_id, w.full_name, s.site_name, a.shift_type,
               a.record_date, a.check_in_time, a.check_out_time,
-              a.total_working_hours, a.overtime_hours, a.status, a.attendance_status
+              a.total_working_hours, a.overtime_hours, a.status, a.attendance_status, a.source
        FROM attendance a
        JOIN workers w ON w.worker_id = a.worker_id
        JOIN sites s ON s.site_id = a.site_id
@@ -50,7 +52,8 @@ exports.listByDate = async (req, res) => {
     const [staff] = await db.execute(
       `SELECT sa.staff_attendance_id, sm.staff_unique_id, sm.full_name, sm.position,
               sa.record_date, sa.check_in_time, sa.check_out_time,
-              sa.regular_hours, sa.overtime_hours, sa.status, sa.attendance_status
+              sa.regular_hours, sa.overtime_hours, sa.status, sa.attendance_status, sa.source,
+              sa.lunch_start_time, sa.lunch_end_time
        FROM staff_attendance sa
        JOIN staff_members sm ON sm.staff_id = sa.staff_id
        WHERE sa.source = 'Biometric' AND (sa.record_date = ? OR DATE(sa.check_out_time) = ?)
@@ -76,12 +79,17 @@ async function editRecord(req, res, kind) {
   }
   const inRaw = req.body?.check_in_time;
   const outRaw = req.body?.check_out_time;
+  // #16: an explicit request to clear a wrong check-out (never touches the raw punch).
+  const clearOut = req.body?.clear_check_out === true;
   const newIn = inRaw ? fmt(inRaw) : null;
   const newOut = outRaw ? fmt(outRaw) : null;
   if ((inRaw && !newIn) || (outRaw && !newOut)) {
     return res.status(400).json({ status: 'error', message: 'Invalid time format.' });
   }
-  if (!newIn && !newOut) {
+  if (clearOut && newOut) {
+    return res.status(400).json({ status: 'error', message: 'Either set a new check-out or clear it, not both.' });
+  }
+  if (!newIn && !newOut && !clearOut) {
     return res.status(400).json({ status: 'error', message: 'Provide a new check-in or check-out time.' });
   }
 
@@ -100,8 +108,15 @@ async function editRecord(req, res, kind) {
     if (rec.source !== 'Biometric') throw new OpError('Only biometric-created records can be edited here.');
     if (!['Draft', 'Submitted'].includes(rec.status)) throw new OpError('Approved records are locked.');
 
+    if (clearOut) {
+      if (rec.status !== 'Draft') {
+        throw new OpError('A check-out can only be cleared on a Draft. Reject the record first.');
+      }
+      if (!rec.check_out_time) throw new OpError('This record has no check-out to clear.');
+    }
+
     const checkIn = newIn || (rec.check_in_time ? toWall(rec.check_in_time) : null);
-    const checkOut = newOut || (rec.check_out_time ? toWall(rec.check_out_time) : null);
+    const checkOut = clearOut ? null : (newOut || (rec.check_out_time ? toWall(rec.check_out_time) : null));
     if (!checkIn) throw new OpError('A check-in time is required.');
 
     if (checkIn.slice(0, 10) !== String(rec.record_date).slice(0, 10)) {
@@ -124,14 +139,26 @@ async function editRecord(req, res, kind) {
       [checkIn, checkOut, id]
     );
 
+    if (clearOut) {
+      // Hours can no longer be known; submit stays blocked until a real OUT exists.
+      if (isWorker) {
+        await connection.execute(
+          'UPDATE attendance SET total_working_hours = NULL, overtime_hours = 0 WHERE attendance_id = ?', [id]);
+      } else {
+        await connection.execute(
+          'UPDATE staff_attendance SET regular_hours = NULL, overtime_hours = NULL WHERE staff_attendance_id = ?', [id]);
+      }
+    }
+
     if (checkOut) {
       try {
         if (isWorker) {
           await attendanceService.calculateWorkingHours(id, connection);
         } else {
-          const [[sm]] = await connection.execute(
-            'SELECT standard_daily_hours FROM staff_members WHERE staff_id = ?', [rec.staff_id]);
-          const profileHours = Number(sm?.standard_daily_hours) > 0 ? Number(sm.standard_daily_hours) : 8;
+          // D3: standard hours that applied on the record's own date.
+          const comp = await getStaffCompensationForDate(
+            rec.staff_id, String(rec.record_date).slice(0, 10), connection);
+          const profileHours = comp ? comp.standard_daily_hours : 8;
           const snapshotMinutes = Number(rec.standard_minutes_snapshot) > 0
             ? Number(rec.standard_minutes_snapshot) : Math.round(profileHours * 60);
           const shift = calculateStaffShiftHours({
@@ -158,7 +185,7 @@ async function editRecord(req, res, kind) {
        VALUES (?, ?, 'BIOMETRIC_ADMIN_EDIT', ?, ?, ?)`,
       [table, id, adminId,
         JSON.stringify({ check_in_time: rec.check_in_time, check_out_time: rec.check_out_time }),
-        JSON.stringify({ check_in_time: checkIn, check_out_time: checkOut, reason })]
+        JSON.stringify({ check_in_time: checkIn, check_out_time: checkOut, cleared_check_out: clearOut, reason })]
     );
 
     await connection.commit();

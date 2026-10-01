@@ -43,7 +43,9 @@ exports.calculateWorkingHours = async (attendance_id, executor = db) => {
     if (end <= start) throw new Error('Check-out must be after check-in.');
 
     let totalMinutes = (end.getTime() - start.getTime()) / 60000;
-    const isLunchPaid = String(await settingsCache.getSetting('is_lunch_paid', 'false')).toLowerCase() === 'true';
+    // D3: the value that applied on the record's own date (not today's value).
+    const recordDateStr = String(record_date).slice(0, 10);
+    const isLunchPaid = String(await settingsCache.getSettingForDate('is_lunch_paid', recordDateStr, 'false')).toLowerCase() === 'true';
     const [leaves] = await executor.execute(
         `SELECT leave_start_time, leave_end_time, leave_type
          FROM attendanceleaveperiods
@@ -80,7 +82,7 @@ if (standard_minutes_snapshot !== null) {
     );
     const workerCustomMinutes = workerRow?.standard_daily_minutes;
 
-    const configuredStandardMinutes = Number(await settingsCache.getSetting('standard_work_minutes', '600'));
+    const configuredStandardMinutes = Number(await settingsCache.getSettingForDate('standard_work_minutes', recordDateStr, '600'));
 
     standardMinutes = (Number.isFinite(Number(workerCustomMinutes)) && Number(workerCustomMinutes) > 0)
         ? Number(workerCustomMinutes)
