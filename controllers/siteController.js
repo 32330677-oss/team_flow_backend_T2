@@ -1,4 +1,6 @@
 const db = require('../config/db');
+const { businessToday, isValidDateOnly } = require('../services/businessDate');
+const { recordSiteStatusChange } = require('../services/siteStatusService');
 const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
 
 exports.getSitesByContract = async (req, res) => {
@@ -138,55 +140,92 @@ const [result] = await connection.query(
 };
 
 // Update site details
+// H-03: supervisor / name changes are audited with old and new values.
 exports.updateSite = async (req, res) => {
     const { siteId } = req.params;
     const { site_name, location, supervisor_id } = req.body;
-
+    const connection = await db.getConnection();
     try {
-        const query = `
-            UPDATE sites 
-            SET site_name = ?, location = ?, supervisor_id = ?
-            WHERE site_id = ?
-        `;
-        const [result] = await db.query(query, [site_name, location || null, supervisor_id || null, siteId]);
-
-        if (result.affectedRows === 0) {
+        await connection.beginTransaction();
+        const [[old]] = await connection.execute('SELECT site_id, site_name, location, supervisor_id FROM sites WHERE site_id = ? FOR UPDATE', [siteId]);
+        if (!old) {
+            await connection.rollback();
             return res.status(404).json({ status: 'error', message: 'Site not found' });
         }
-
+        await connection.execute(
+            'UPDATE sites SET site_name = ?, location = ?, supervisor_id = ? WHERE site_id = ?',
+            [site_name, location || null, supervisor_id || null, siteId]
+        );
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('sites', ?, 'SITE_UPDATED', ?, ?, ?)`,
+            [siteId, req.user.user_id, JSON.stringify(old),
+                JSON.stringify({ site_name, location: location || null, supervisor_id: supervisor_id || null })]
+        );
+        await connection.commit();
         return res.status(200).json({ status: 'success', message: 'Site updated successfully' });
     } catch (error) {
-        console.error("🚨 UPDATE ERROR:", error);
+        await connection.rollback();
+        console.error("UPDATE SITE ERROR:", error);
         return res.status(500).json({ status: 'error', message: 'Server error while updating site' });
+    } finally {
+        connection.release();
     }
 };
 
 // Toggle site status (Active / Suspended / Completed)
+// D-05: every change is stored in site_status_history with the date it takes
+// effect (default: business today), so historical processing uses the status
+// that applied on each date.
 exports.toggleSiteStatus = async (req, res) => {
     const { siteId } = req.params;
     const { status } = req.body;
+    const effectiveDate = req.body.effective_date || businessToday();
+    const reason = req.body.reason ? String(req.body.reason).trim().slice(0, 500) : null;
 
     if (!['Active', 'Completed', 'Suspended'].includes(status)) {
         return res.status(400).json({ status: 'error', message: 'Invalid status value' });
     }
-
+    if (!isValidDateOnly(effectiveDate) || effectiveDate > businessToday()) {
+        return res.status(400).json({ status: 'error', message: 'effective_date must be a valid date that is not in the future.' });
+    }
+    const connection = await db.getConnection();
     try {
-        const [result] = await db.query(
-            'UPDATE sites SET site_status = ? WHERE site_id = ?',
-            [status, siteId]
-        );
-
-        if (result.affectedRows === 0) {
+        await connection.beginTransaction();
+        const [[site]] = await connection.execute('SELECT site_id, site_status FROM sites WHERE site_id = ? FOR UPDATE', [siteId]);
+        if (!site) {
+            await connection.rollback();
             return res.status(404).json({ status: 'error', message: 'Site not found' });
         }
-
-        return res.status(200).json({
-            status: 'success',
-            message: `Site status updated to ${status}`
+        if (site.site_status === status) {
+            await connection.rollback();
+            return res.status(400).json({ status: 'error', message: `Site is already ${status}.` });
+        }
+        const [[last]] = await connection.execute(
+            `SELECT DATE_FORMAT(effective_date, '%Y-%m-%d') AS effective_date FROM site_status_history
+             WHERE site_id = ? ORDER BY effective_date DESC, site_status_history_id DESC LIMIT 1`, [siteId]);
+        if (last && effectiveDate < last.effective_date) {
+            await connection.rollback();
+            return res.status(400).json({ status: 'error', message: `effective_date cannot be before the last status change (${last.effective_date}).` });
+        }
+        await connection.execute('UPDATE sites SET site_status = ? WHERE site_id = ?', [status, siteId]);
+        await recordSiteStatusChange(connection, {
+            siteId, oldStatus: site.site_status, newStatus: status, effectiveDate, reason, userId: req.user.user_id,
         });
+        await connection.execute(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('sites', ?, 'SITE_STATUS_CHANGED', ?, ?, ?)`,
+            [siteId, req.user.user_id, JSON.stringify({ site_status: site.site_status }),
+                JSON.stringify({ site_status: status, effective_date: effectiveDate, reason })]
+        );
+        await connection.commit();
+        return res.status(200).json({ status: 'success', message: `Site status updated to ${status} (effective ${effectiveDate})` });
     } catch (error) {
-        console.error("🚨 STATUS ERROR:", error);
+        await connection.rollback();
+        console.error("SITE STATUS ERROR:", error);
         return res.status(500).json({ status: 'error', message: 'Server error while updating site status' });
+    } finally {
+        connection.release();
     }
 };
 
@@ -257,11 +296,18 @@ exports.upsertSiteShiftSupervisor = async (req, res) => {
         return res.status(400).json({ status: 'error', message: 'shift_type must be Day or Night' });
     }
     try {
+        const [[old]] = await db.query('SELECT supervisor_id FROM site_shifts WHERE site_id = ? AND shift_type = ?', [siteId, shift_type]);
         await db.query(
             `INSERT INTO site_shifts (site_id, shift_type, supervisor_id)
              VALUES (?, ?, ?)
              ON DUPLICATE KEY UPDATE supervisor_id = VALUES(supervisor_id)`,
             [siteId, shift_type, supervisor_id || null]
+        );
+        await db.query(
+            `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+             VALUES ('site_shifts', ?, 'SHIFT_SUPERVISOR_CHANGED', ?, ?, ?)`,
+            [siteId, req.user.user_id, JSON.stringify({ shift_type, supervisor_id: old ? old.supervisor_id : null }),
+                JSON.stringify({ shift_type, supervisor_id: supervisor_id || null })]
         );
         res.status(200).json({ status: 'success', message: 'Shift supervisor updated' });
     } catch (error) {

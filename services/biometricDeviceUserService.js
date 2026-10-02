@@ -680,6 +680,15 @@ async function endDeviceUserMapping({
       );
     }
 
+    // C-15: ending (or extending) a mapping may never make it overlap another
+    // active mapping of the same device ID.
+    if (await hasOverlappingMapping(connection, mapping.device_employee_id, effectiveFrom, effectiveTo, mappingId)) {
+      throw createServiceError(
+        'This end date would overlap another active mapping of the same device ID.',
+        409
+      );
+    }
+
     const oldValues = {
       device_employee_id: mapping.device_employee_id,
       entity_type: mapping.entity_type,

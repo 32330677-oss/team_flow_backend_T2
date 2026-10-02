@@ -6,7 +6,8 @@
 // the "don't merge staff and worker logic" precedent already in this codebase.
 
 const db = require('../config/db');
-const { businessToday } = require('../services/businessDate');
+const { businessToday, addDays } = require('../services/businessDate');
+const { activeOn } = require('../services/assignmentDates');
 
 function isValidDateOnly(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
@@ -91,10 +92,11 @@ exports.assignSupervisor = async (req, res) => {
     // Close any open assignment (explicit reassignment event, mirrors
     // staffAssignmentController.assignToSite's close-then-reopen behavior).
     await connection.execute(
+      // §5: the old assignment's LAST day is the day before the new one starts.
       `UPDATE staff_supervisor_assignments
        SET unassigned_date = ?
        WHERE staff_id = ? AND unassigned_date IS NULL`,
-      [effectiveDate, staffId]
+      [addDays(effectiveDate, -1), staffId]
     );
 
     await connection.execute(
@@ -124,13 +126,18 @@ exports.assignSupervisor = async (req, res) => {
 // DELETE /api/staff/:id/supervisor-assignments/current
 exports.unassignCurrent = async (req, res) => {
   const staffId = Number(req.params.id);
-  const { unassigned_date } = req.body || {};
+  // §5: the date given is the LAST assigned day (inclusive). `unassigned_date`
+  // is accepted as the same meaning for older clients.
+  const lastDay = (req.body || {}).last_day ?? (req.body || {}).unassigned_date;
   const adminId = req.user.user_id;
 
   if (!Number.isInteger(staffId) || staffId <= 0) {
     return res.status(400).json({ status: 'error', message: 'Invalid staff id.' });
   }
-  const effectiveDate = isValidDateOnly(unassigned_date) ? unassigned_date : businessToday();   // B10
+  if (!isValidDateOnly(lastDay)) {
+    return res.status(400).json({ status: 'error', message: 'last_day (YYYY-MM-DD) is required: the LAST day of the current assignment.' });
+  }
+  const effectiveDate = lastDay;
 
   const connection = await db.getConnection();
   try {
@@ -139,8 +146,8 @@ exports.unassignCurrent = async (req, res) => {
     const [result] = await connection.execute(
       `UPDATE staff_supervisor_assignments
        SET unassigned_date = ?
-       WHERE staff_id = ? AND unassigned_date IS NULL`,
-      [effectiveDate, staffId]
+       WHERE staff_id = ? AND unassigned_date IS NULL AND assigned_date <= DATE_ADD(?, INTERVAL 1 DAY)`,
+      [effectiveDate, staffId, effectiveDate]
     );
     if (result.affectedRows === 0) {
       await connection.rollback();
@@ -230,7 +237,7 @@ exports.bulkAssignSupervisor = async (req, res) => {
         `UPDATE staff_supervisor_assignments
          SET unassigned_date = ?
          WHERE staff_id = ? AND unassigned_date IS NULL`,
-        [effectiveDate, staffId]
+        [addDays(effectiveDate, -1), staffId]
       );
 
       await connection.execute(
@@ -270,8 +277,7 @@ exports.getAssignedStaffIdsForSupervisor = async (supervisorUserId, executor = d
   const [rows] = await executor.execute(
    `SELECT staff_id FROM staff_supervisor_assignments
  WHERE supervisor_user_id = ?
-   AND assigned_date <= ?
-   AND (unassigned_date IS NULL OR unassigned_date > ?)`,
+   AND ${activeOn('', '?')}`,
     [supervisorUserId, today, today]
   );
   return rows.map((r) => r.staff_id);
@@ -288,8 +294,7 @@ exports.getMyAssignedStaff = async (req, res) => {
        FROM staff_supervisor_assignments ssa
        JOIN staff_members sm ON sm.staff_id = ssa.staff_id
        WHERE ssa.supervisor_user_id = ?
-         AND ssa.assigned_date <= ?
-         AND (ssa.unassigned_date IS NULL OR ssa.unassigned_date > ?)
+         AND ${activeOn('ssa')}
          AND sm.status = 'Active'
        ORDER BY sm.full_name`,
       [supervisorId, businessToday(), businessToday()]

@@ -4,20 +4,77 @@ const path = require('path');
 const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
 const { businessToday, addDays, isValidDateOnly, toDateOnly } = require('../services/businessDate');
 const { getLastStatusChange, recordWorkerStatusChange } = require('../services/workerStatusService');
+const { currentOrFuture } = require('../services/assignmentDates');
+const fs = require('fs');
+
+const UPLOAD_DIR = path.join(__dirname, '..', 'uploads');
+const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
+const ALLOWED_IMAGE_EXT = ['.jpg', '.jpeg', '.png', '.webp'];
 
 const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, 'uploads/'),
+    destination: (req, file, cb) => {
+        try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (_) {}
+        cb(null, 'uploads/');
+    },
     filename: (req, file, cb) => {
         const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+        cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname).toLowerCase());
     }
 });
-const upload = multer({ storage: storage });
+// C-18: images only, max 5 MB each.
+const upload = multer({
+    storage,
+    limits: { fileSize: 5 * 1024 * 1024, files: 2 },
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname || '').toLowerCase();
+        if (ALLOWED_IMAGE_TYPES.includes(file.mimetype) && ALLOWED_IMAGE_EXT.includes(ext)) return cb(null, true);
+        const error = new Error('Only JPG, PNG or WEBP images are allowed.');
+        error.code = 'INVALID_FILE_TYPE';
+        return cb(error);
+    },
+});
 
-exports.uploadWorkerFiles = upload.fields([
+// Worker photos are served ONLY through the authenticated Admin endpoint
+// GET /api/workers/:id/files/:type (C-18). The API returns that URL.
+function protectedFileUrl(req, workerId, type) {
+    return `${req.protocol}://${req.get('host')}/api/workers/${workerId}/files/${type}`;
+}
+
+const uploadFields = upload.fields([
     { name: 'personal_photo', maxCount: 1 },
     { name: 'id_photo', maxCount: 1 }
 ]);
+exports.uploadWorkerFiles = (req, res, next) => uploadFields(req, res, (err) => {
+    if (!err) return next();
+    const message = err.code === 'LIMIT_FILE_SIZE' ? 'Each image must be 5 MB or smaller.'
+        : err.code === 'INVALID_FILE_TYPE' ? err.message : 'Error uploading files.';
+    return res.status(400).json({ status: 'error', message });
+});
+
+// GET /api/workers/:id/files/:type   (Admin only, see routes)
+exports.getWorkerFile = async (req, res) => {
+    try {
+        const workerId = Number(req.params.id);
+        const type = req.params.type;
+        if (!Number.isInteger(workerId) || workerId <= 0 || !['personal_photo', 'id_photo'].includes(type)) {
+            return res.status(400).json({ status: 'error', message: 'Invalid request.' });
+        }
+        const [[row]] = await db.execute(`SELECT ${type} AS file_path FROM workers WHERE worker_id = ? LIMIT 1`, [workerId]);
+        if (!row || !row.file_path) return res.status(404).json({ status: 'error', message: 'File not found.' });
+        // Accept legacy values stored as full URLs or relative paths; resolve the
+        // file name inside uploads/ only (no path traversal).
+        const fileName = path.basename(String(row.file_path).replace(/\\/g, '/'));
+        const absolute = path.join(UPLOAD_DIR, fileName);
+        if (!absolute.startsWith(UPLOAD_DIR) || !fs.existsSync(absolute)) {
+            return res.status(404).json({ status: 'error', message: 'File not found.' });
+        }
+        res.setHeader('Cache-Control', 'private, no-store');
+        return res.sendFile(absolute);
+    } catch (error) {
+        console.error('GET WORKER FILE ERROR:', error);
+        return res.status(500).json({ status: 'error', message: 'Failed to load the file.' });
+    }
+};
 
 // ---------------------------------------------------------
 // Server-side validation — NEVER trust the frontend (section 3)
@@ -61,65 +118,98 @@ function normalizedCompensationValues(payment_type, daily_rate, regular_hourly_r
     return { daily_rate: Number(daily_rate), regular_hourly_rate: null, overtime_hourly_rate: null };
 }
 
+// D-07: role-specific projection at the API level.
+//   Admin      -> full worker record (photos as protected API URLs).
+//   Supervisor -> operational fields only, and only workers currently assigned
+//                 to the sites/shifts the supervisor manages. No rates, no
+//                 identity documents, no mother's name / birth data / phone.
+// §31: optional server-side search & pagination: q, status, site_id, page, page_size
+//      (without `page` every matching row is returned, as before).
+const SUPERVISOR_WORKER_FIELDS = ['worker_id', 'worker_unique_id', 'full_name', 'job_position', 'status'];
+
 exports.getAllWorkers = async (req, res) => {
     try {
+        const isAdmin = req.user.role === 'Admin';
+        const today = require('../services/businessDate').businessToday();
+        const where = [];
+        const params = [today];
+        const q = String(req.query.q || '').trim();
+        if (q) { where.push('(w.full_name LIKE ? OR w.worker_unique_id LIKE ? OR w.phone_number LIKE ?)'); params.push(`%${q}%`, `%${q}%`, `%${q}%`); }
+        if (['Active', 'Inactive'].includes(req.query.status)) { where.push('w.status = ?'); params.push(req.query.status); }
+        if (Number(req.query.site_id) > 0) {
+            where.push(`EXISTS (SELECT 1 FROM workersiteassignments x WHERE x.worker_id = w.worker_id AND x.site_id = ? AND ${currentOrFuture('x', '?')})`);
+            params.push(Number(req.query.site_id), today);
+        }
+        if (!isAdmin) {
+            where.push(`EXISTS (SELECT 1 FROM workersiteassignments x JOIN sites sx ON sx.site_id = x.site_id
+                         WHERE x.worker_id = w.worker_id AND ${currentOrFuture('x', '?')}
+                           AND ((sx.supports_shifts = 0 AND sx.supervisor_id = ?)
+                                OR (sx.supports_shifts = 1 AND EXISTS (SELECT 1 FROM site_shifts ss
+                                     WHERE ss.site_id = x.site_id AND ss.shift_type = x.shift_type AND ss.supervisor_id = ?))))`);
+            params.push(today, req.user.user_id, req.user.user_id);
+        }
+        const columns = isAdmin ? 'w.*' : SUPERVISOR_WORKER_FIELDS.map((c) => `w.${c}`).join(', ');
+        const page = Number(req.query.page);
+        const pageSize = Math.min(200, Math.max(10, Number(req.query.page_size) || 50));
+        const limitSql = Number.isInteger(page) && page > 0 ? ` LIMIT ${pageSize} OFFSET ${(page - 1) * pageSize}` : '';
+        const whereSql = where.length ? `WHERE ${where.join(' AND ')}` : '';
+
         const query = `
-            SELECT w.*,
+            SELECT ${columns},
                    (
                      SELECT JSON_ARRAYAGG(
-                       JSON_OBJECT('site_id', wsa2.site_id, 'site_name', s2.site_name, 'shift_type', wsa2.shift_type)
+                       JSON_OBJECT('site_id', wsa2.site_id, 'site_name', s2.site_name, 'shift_type', wsa2.shift_type,
+                                   'assignment_id', wsa2.assignment_id,
+                                   'assigned_date', DATE_FORMAT(wsa2.assigned_date, '%Y-%m-%d'),
+                                   'last_day', DATE_FORMAT(wsa2.unassigned_date, '%Y-%m-%d'))
                      )
                      FROM workersiteassignments wsa2
                      JOIN sites s2 ON s2.site_id = wsa2.site_id
-                     WHERE wsa2.worker_id = w.worker_id AND wsa2.unassigned_date IS NULL
+                     WHERE wsa2.worker_id = w.worker_id AND ${currentOrFuture('wsa2', '?')}
                    ) AS assignments_json
             FROM workers w
-            ORDER BY w.created_at DESC`;
-        const [rows] = await db.query(query);
-        console.log('T2 WORKERS DB CHECK:', {
-    dbName: process.env.DB_NAME,
-    worker38Assignments: rows.find(r => r.worker_id === 38)?.assignments_json
-});
+            ${whereSql}
+            ORDER BY w.created_at DESC${limitSql}`;
+        // The first ? belongs to the sub-select (assignments_json) — keep order.
+        const queryParams = [today, ...params.slice(1)];
+        const [rows] = await db.query(query, queryParams);
 
-        const processedRows = rows.map(row => {
-    let assignments = [];
+        let total = null;
+        if (limitSql) {
+            const [[c]] = await db.query(`SELECT COUNT(*) AS total FROM workers w ${whereSql}`, params.slice(1));
+            total = Number(c.total);
+        }
 
-try {
-    if (Array.isArray(row.assignments_json)) {
-        assignments = row.assignments_json;
-    } else if (row.assignments_json) {
-        assignments = JSON.parse(row.assignments_json);
-    }
-} catch (_) {
-    assignments = [];
-}
+        const processedRows = rows.map((row) => {
+            let assignments = [];
+            try {
+                if (Array.isArray(row.assignments_json)) assignments = row.assignments_json;
+                else if (row.assignments_json) assignments = JSON.parse(row.assignments_json);
+            } catch (_) {
+                assignments = [];
+            }
             row.assigned_site_id = assignments[0]?.site_id ?? null;
             row.assigned_site_name = assignments.length
-                ? assignments.map(a => `${a.site_name} (${a.shift_type})`).join(', ')
+                ? assignments.map((a) => `${a.site_name} (${a.shift_type})`).join(', ')
                 : null;
             row.assignments = assignments;
-            if (row.worker_id === 38) {
-    console.log('WORKER 38 FINAL RESPONSE:', {
-        assigned_site_id: row.assigned_site_id,
-        assigned_site_name: row.assigned_site_name,
-        assignments: row.assignments
-    });
-}
             delete row.assignments_json;
 
-            if (row.personal_photo && !row.personal_photo.startsWith('http')) {
-                row.personal_photo = `${req.protocol}://${req.get('host')}/${row.personal_photo.replace(/\\/g, '/')}`;
-            }
-            if (row.id_photo && !row.id_photo.startsWith('http')) {
-                row.id_photo = `${req.protocol}://${req.get('host')}/${row.id_photo.replace(/\\/g, '/')}`;
+            if (isAdmin) {
+                row.personal_photo = row.personal_photo ? protectedFileUrl(req, row.worker_id, 'personal_photo') : null;
+                row.id_photo = row.id_photo ? protectedFileUrl(req, row.worker_id, 'id_photo') : null;
             }
             return row;
         });
 
-        return res.status(200).json({ status: 'success', data: processedRows });
+        return res.status(200).json({
+            status: 'success',
+            data: processedRows,
+            pagination: limitSql ? { page, page_size: pageSize, total } : null,
+        });
     } catch (error) {
-        console.error("🚨 FETCH WORKERS ERROR:", error);
-        return res.status(500).json({ status: 'error', message: 'حدث خطأ أثناء جلب بيانات العمال' });
+        console.error("FETCH WORKERS ERROR:", error);
+        return res.status(500).json({ status: 'error', message: 'Failed to load workers.' });
     }
 };
 
@@ -371,7 +461,9 @@ exports.updateWorker = async (req, res) => {
 
     uploadMiddleware(req, res, async (err) => {
         if (err) {
-            return res.status(500).json({ status: 'error', message: 'Error uploading files' });
+            const message = err.code === 'LIMIT_FILE_SIZE' ? 'Each image must be 5 MB or smaller.'
+                : err.code === 'INVALID_FILE_TYPE' ? err.message : 'Error uploading files';
+            return res.status(400).json({ status: 'error', message });
         }
 
         const connection = await db.getConnection();
@@ -507,10 +599,11 @@ const touchesCompensation =
                     await connection.rollback();
                     return res.status(400).json({ status: 'error', message: 'status must be Active or Inactive.' });
                 }
-                const statusEffectiveDate = req.body.status_effective_date || businessToday();
+                // §27: the effective date is mandatory (no silent "today" default).
+                const statusEffectiveDate = req.body.status_effective_date;
                 if (!isValidDateOnly(statusEffectiveDate)) {
                     await connection.rollback();
-                    return res.status(400).json({ status: 'error', message: 'status_effective_date must be a valid date (YYYY-MM-DD).' });
+                    return res.status(400).json({ status: 'error', message: 'status_effective_date (YYYY-MM-DD) is required for a status change: the first day the new status applies.' });
                 }
                 if (statusEffectiveDate > businessToday()) {
                     await connection.rollback();
@@ -541,6 +634,37 @@ const touchesCompensation =
                     [existing.worker_id, req.user.user_id, JSON.stringify({ status: existing.status }),
                         JSON.stringify({ status, effective_date: statusEffectiveDate, reason: statusReason })]
                 );
+
+                // §27 / R-14: becoming Inactive does NOT close assignments by
+                // itself (status and assignment are separate). Only when the Admin
+                // explicitly gives the LAST assigned day are the open assignments
+                // ended at that date (inclusive), with the same attendance checks
+                // as End Assignment.
+                const lastAssignedDay = req.body.end_assignments_last_day;
+                if (status === 'Inactive' && lastAssignedDay !== undefined && lastAssignedDay !== null && lastAssignedDay !== '') {
+                    if (!isValidDateOnly(lastAssignedDay)) {
+                        await connection.rollback();
+                        return res.status(400).json({ status: 'error', message: 'end_assignments_last_day must be a valid date (YYYY-MM-DD).' });
+                    }
+                    const { endAssignment } = require('../routes/assignmentRoutes')._internal;
+                    const [openAssignments] = await connection.execute(
+                        `SELECT assignment_id FROM workersiteassignments
+                         WHERE worker_id = ? AND (unassigned_date IS NULL OR unassigned_date > ?)`,
+                        [existing.worker_id, lastAssignedDay]
+                    );
+                    for (const oa of openAssignments) {
+                        try {
+                            await endAssignment(connection, {
+                                assignmentId: oa.assignment_id, lastDay: lastAssignedDay,
+                                reason: `Worker set Inactive from ${statusEffectiveDate}${statusReason ? `: ${statusReason}` : ''}`,
+                                userId: req.user.user_id,
+                            });
+                        } catch (endError) {
+                            await connection.rollback();
+                            return res.status(endError.statusCode || 400).json({ status: 'error', message: endError.message, ...(endError.extra || {}) });
+                        }
+                    }
+                }
             }
 
             const personalPhotoPath = req.files && req.files['personal_photo']
@@ -619,7 +743,7 @@ exports.getCompensationHistory = async (req, res) => {
         );
         return res.status(200).json({ status: 'success', data: rows });
     } catch (error) {
-        console.error("🚨 FETCH COMPENSATION HISTORY ERROR:", error);
+        console.error("FETCH COMPENSATION HISTORY ERROR:", error);
         return res.status(500).json({ status: 'error', message: 'Failed to load compensation history' });
     }
 };

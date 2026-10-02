@@ -1,33 +1,19 @@
 // controllers/staffPayrollVersioningController.js
 //
-// Adds finalization and versioning on top of the existing
-// controllers/StaffPayrollController.js. Kept as a separate file so the
-// original generation/report/details logic is untouched; wire these two
-// new endpoints in alongside the existing ones.
+// Staff payroll finalization, correction (supersede) and void.
 //
-// IMPORTANT — one required change to the existing generateStaffPayrollBatch
-// overlap check in StaffPayrollController.js: its overlap query currently
-// does:
-//   SELECT staff_payroll_batch_id FROM staff_payroll_batches
-//   WHERE start_date <= ? AND end_date >= ? LIMIT 1 FOR UPDATE
-// This must be changed to exclude superseded batches so a corrected/new
-// version can be generated for a period whose old batch was superseded:
-//   ... WHERE start_date <= ? AND end_date >= ? AND status <> 'Superseded'
-//       LIMIT 1 FOR UPDATE
-//
-// Wire into routes/StaffPayrollRoutes.js:
-//   const versioning = require('../controllers/staffPayrollVersioningController');
-//   router.patch('/batch/:batchId/finalize', versioning.finalizeBatch);
-//   router.post('/batch/:batchId/new-version', versioning.createNewVersion);
-//   router.get('/batch/:batchId/versions', versioning.getVersionChain);
+// D-03 (same policy as worker payroll):
+//   Generated (not finalized) -> may be VOIDED with a reason (nothing deleted).
+//   Finalized (not paid)      -> corrected only by SUPERSEDE: the replacement is
+//                                generated and verified first, then the old
+//                                batch becomes Superseded, in ONE transaction.
+//                                If generation fails, the old batch is unchanged.
+//   Paid                      -> never reopened / superseded (API-enforced).
 
 const pool = require('../config/db');
+const { generateStaffPayrollBatch } = require('./StaffPayrollController');
 
 // PATCH /api/staff-payroll/batch/:batchId/finalize
-// A batch must be finalized before it can be marked Paid. Finalizing freezes
-// it: no further "new-version" chains can point to editing it directly —
-// corrections after finalization must go through createNewVersion, which
-// supersedes it rather than mutating it.
 async function finalizeBatch(req, res) {
   const batchId = Number(req.params.batchId);
   const userId = req.user?.user_id;
@@ -38,7 +24,6 @@ async function finalizeBatch(req, res) {
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-
     const [rows] = await connection.execute(
       'SELECT * FROM staff_payroll_batches WHERE staff_payroll_batch_id = ? FOR UPDATE',
       [batchId]
@@ -48,9 +33,9 @@ async function finalizeBatch(req, res) {
       return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' });
     }
     const batch = rows[0];
-    if (batch.status === 'Superseded') {
+    if (batch.status === 'Superseded' || batch.status === 'Voided') {
       await connection.rollback();
-      return res.status(409).json({ status: 'error', message: 'A superseded batch cannot be finalized.' });
+      return res.status(409).json({ status: 'error', message: `A ${batch.status.toLowerCase()} batch cannot be finalized.` });
     }
     if (batch.is_finalized) {
       await connection.rollback();
@@ -63,15 +48,13 @@ async function finalizeBatch(req, res) {
        WHERE staff_payroll_batch_id = ?`,
       [userId, batchId]
     );
-
     await connection.execute(
       `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
        VALUES ('staff_payroll_batches', ?, 'FINALIZED', ?, ?, ?)`,
       [batchId, userId, JSON.stringify({ is_finalized: false }), JSON.stringify({ is_finalized: true })]
     );
-
     await connection.commit();
-    return res.json({ status: 'success', message: 'Payroll batch finalized. It can now be marked as paid.' });
+    return res.json({ status: 'success', message: 'Payroll batch finalized. Staff attendance in this period is now locked for normal editing. It can now be marked as paid.' });
   } catch (error) {
     await connection.rollback();
     console.error('finalizeBatch:', error);
@@ -81,79 +64,79 @@ async function finalizeBatch(req, res) {
   }
 }
 
-// POST /api/staff-payroll/batch/:batchId/new-version
-// Marks the given batch as Superseded and returns the parameters the client
-// should call /generate with, for the SAME period, so the normal generation
-// path (with all its validation) produces the replacement. This endpoint
-// does NOT itself recompute salaries — it only performs the supersession,
-// keeping the money-calculation logic in exactly one place
-// (generateStaffPayrollBatch).
+// POST /api/staff-payroll/batch/:batchId/new-version   { reason, acknowledge_pending? }
+// Atomic supersede: Validate -> generate replacement -> verify -> supersede -> commit.
 async function createNewVersion(req, res) {
   const batchId = Number(req.params.batchId);
-  const { reason } = req.body || {};
-  const userId = req.user?.user_id;
-
+  const reason = String(req.body?.reason || '').trim();
   if (!Number.isInteger(batchId) || batchId <= 0) {
     return res.status(400).json({ status: 'error', message: 'Invalid batch id.' });
   }
-  if (!reason || !String(reason).trim()) {
-    return res.status(400).json({ status: 'error', message: 'A reason is required to supersede a payroll batch.' });
+  if (reason.length < 5) {
+    return res.status(400).json({ status: 'error', message: 'A reason (at least 5 characters) is required to supersede a payroll batch.' });
   }
+  try {
+    const [[batch]] = await pool.execute('SELECT * FROM staff_payroll_batches WHERE staff_payroll_batch_id = ?', [batchId]);
+    if (!batch) return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' });
+    if (batch.status === 'Paid') {
+      return res.status(409).json({ status: 'error', message: 'A Paid batch cannot be superseded. Record the difference through the correction/adjustment workflow.' });
+    }
+    if (batch.status !== 'Generated') {
+      return res.status(409).json({ status: 'error', message: `Only the active batch of a period can be superseded (this one is ${batch.status}).` });
+    }
+    req.body = {
+      start_date: String(batch.start_date).slice(0, 10),
+      end_date: String(batch.end_date).slice(0, 10),
+      acknowledge_pending: req.body?.acknowledge_pending === true,
+    };
+    req._supersede = { batchId, reason: reason.slice(0, 500) };
+    return generateStaffPayrollBatch(req, res);
+  } catch (error) {
+    console.error('createNewVersion:', error);
+    return res.status(500).json({ status: 'error', message: 'Failed to supersede payroll batch.' });
+  }
+}
 
+// PATCH /api/staff-payroll/batch/:batchId/void   { reason }
+async function voidBatch(req, res) {
+  const batchId = Number(req.params.batchId);
+  const reason = String(req.body?.reason || '').trim();
+  const userId = req.user?.user_id;
+  if (!Number.isInteger(batchId) || batchId <= 0) return res.status(400).json({ status: 'error', message: 'Invalid batch id.' });
+  if (reason.length < 5) return res.status(400).json({ status: 'error', message: 'A reason (at least 5 characters) is required to void a batch.' });
   const connection = await pool.getConnection();
   try {
     await connection.beginTransaction();
-
-    const [rows] = await connection.execute(
-      'SELECT * FROM staff_payroll_batches WHERE staff_payroll_batch_id = ? FOR UPDATE',
-      [batchId]
-    );
-    if (!rows.length) {
+    const [[batch]] = await connection.execute('SELECT * FROM staff_payroll_batches WHERE staff_payroll_batch_id = ? FOR UPDATE', [batchId]);
+    if (!batch) { await connection.rollback(); return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' }); }
+    if (batch.status !== 'Generated' || batch.is_finalized) {
       await connection.rollback();
-      return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' });
+      return res.status(409).json({ status: 'error', message: batch.is_finalized
+        ? 'A finalized batch cannot be voided. Use Supersede (with a reason) to correct it.'
+        : `Only a Generated batch can be voided (this one is ${batch.status}).` });
     }
-    const batch = rows[0];
-    if (batch.status === 'Superseded') {
-      await connection.rollback();
-      return res.status(409).json({ status: 'error', message: 'This batch has already been superseded.' });
-    }
-
-    // A Paid batch can still be corrected (money already sent doesn't vanish
-    // from history), but the correction is always a NEW batch, never an edit.
     await connection.execute(
-      `UPDATE staff_payroll_batches SET status = 'Superseded' WHERE staff_payroll_batch_id = ?`,
-      [batchId]
+      `UPDATE staff_payroll_batches SET status = 'Voided', voided_by_user_id = ?, voided_at = NOW(), void_reason = ?
+       WHERE staff_payroll_batch_id = ? AND status = 'Generated' AND is_finalized = 0`,
+      [userId, reason.slice(0, 500), batchId]
     );
-
     await connection.execute(
       `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
-       VALUES ('staff_payroll_batches', ?, 'SUPERSEDED', ?, ?, ?)`,
-      [batchId, userId, JSON.stringify({ status: batch.status }), JSON.stringify({ status: 'Superseded', reason })]
+       VALUES ('staff_payroll_batches', ?, 'VOIDED', ?, ?, ?)`,
+      [batchId, userId, JSON.stringify({ status: batch.status }), JSON.stringify({ status: 'Voided', reason })]
     );
-
     await connection.commit();
-    return res.json({
-      status: 'success',
-      message: 'Batch marked as superseded. Generate a new batch for the same period to create version ' + (batch.version_number + 1) + '.',
-      next_version_params: {
-        start_date: batch.start_date,
-        end_date: batch.end_date,
-        version_number: batch.version_number + 1,
-        supersedes_batch_id: batchId,
-      },
-    });
+    return res.json({ status: 'success', message: `Batch #${batchId} voided. It stays in the history; its period can be generated again.` });
   } catch (error) {
     await connection.rollback();
-    console.error('createNewVersion:', error);
-    return res.status(500).json({ status: 'error', message: 'Failed to supersede payroll batch.' });
+    console.error('voidBatch:', error);
+    return res.status(500).json({ status: 'error', message: 'Failed to void the batch.' });
   } finally {
     connection.release();
   }
 }
 
 // GET /api/staff-payroll/batch/:batchId/versions
-// Walks both directions of the supersedes_batch_id chain so the UI can show
-// "Version 1 (superseded) -> Version 2 (superseded) -> Version 3 (current)".
 async function getVersionChain(req, res) {
   const batchId = Number(req.params.batchId);
   if (!Number.isInteger(batchId) || batchId <= 0) {
@@ -167,7 +150,6 @@ async function getVersionChain(req, res) {
     if (!anchorRows.length) {
       return res.status(404).json({ status: 'error', message: 'Payroll batch not found.' });
     }
-
     const [allForPeriod] = await pool.execute(
       `SELECT spb.*, u.full_name AS generated_by
        FROM staff_payroll_batches spb
@@ -176,7 +158,6 @@ async function getVersionChain(req, res) {
        ORDER BY spb.version_number ASC`,
       [anchorRows[0].start_date, anchorRows[0].end_date]
     );
-
     return res.json({ status: 'success', data: allForPeriod });
   } catch (error) {
     console.error('getVersionChain:', error);
@@ -184,4 +165,4 @@ async function getVersionChain(req, res) {
   }
 }
 
-module.exports = { finalizeBatch, createNewVersion, getVersionChain };
+module.exports = { finalizeBatch, createNewVersion, voidBatch, getVersionChain };

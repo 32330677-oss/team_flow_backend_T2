@@ -40,7 +40,7 @@ async function getDailyDashboard(req, res) {
           COUNT(DISTINCT CASE WHEN a.attendance_status = 'Vacation' THEN w.worker_id END) AS vacation_count,
           COUNT(DISTINCT CASE WHEN a.attendance_status = 'Holiday' THEN w.worker_id END) AS holiday_count
        FROM sites s
-       LEFT JOIN workersiteassignments wsa ON wsa.site_id = s.site_id AND wsa.unassigned_date IS NULL
+       LEFT JOIN workersiteassignments wsa ON wsa.site_id = s.site_id AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= CURDATE())
        LEFT JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
        LEFT JOIN attendance a ON a.worker_id = w.worker_id AND a.site_id = s.site_id AND a.record_date = ?
        LEFT JOIN attendanceleaveperiods alp ON alp.attendance_id = a.attendance_id AND alp.leave_end_time IS NULL
@@ -223,7 +223,7 @@ async function getWeeklyDashboard(req, res) {
           COUNT(DISTINCT w.worker_id) AS total_assigned,
           COUNT(DISTINCT CASE WHEN a.check_in_time IS NOT NULL THEN CONCAT(a.worker_id, '-', a.record_date) END) AS attended_person_days
        FROM sites s
-       LEFT JOIN workersiteassignments wsa ON wsa.site_id = s.site_id AND wsa.unassigned_date IS NULL
+       LEFT JOIN workersiteassignments wsa ON wsa.site_id = s.site_id AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= CURDATE())
        LEFT JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
        LEFT JOIN attendance a ON a.worker_id = w.worker_id AND a.site_id = s.site_id AND a.record_date BETWEEN ? AND ?
        WHERE s.site_status = 'Active'${scoped ? ' AND s.site_id = ?' : ''}
@@ -291,7 +291,7 @@ async function getMonthlyDashboard(req, res) {
        FROM workersiteassignments wsa
        JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
        LEFT JOIN attendance a ON a.worker_id = w.worker_id AND a.site_id = wsa.site_id AND a.record_date BETWEEN ? AND ?
-       WHERE wsa.unassigned_date IS NULL${assignSiteFilter}`,
+       WHERE (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= CURDATE())${assignSiteFilter}`,
       [startDate, endDate, ...assignSiteParams]
     );
 
@@ -379,7 +379,7 @@ async function getMonthlyDashboard(req, res) {
           COUNT(DISTINCT w.worker_id) AS total_assigned,
           COUNT(DISTINCT CASE WHEN a.check_in_time IS NOT NULL THEN CONCAT(a.worker_id, '-', a.record_date) END) AS attended_person_days
        FROM sites s
-       LEFT JOIN workersiteassignments wsa ON wsa.site_id = s.site_id AND wsa.unassigned_date IS NULL
+       LEFT JOIN workersiteassignments wsa ON wsa.site_id = s.site_id AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= CURDATE())
        LEFT JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
        LEFT JOIN attendance a ON a.worker_id = w.worker_id AND a.site_id = s.site_id AND a.record_date BETWEEN ? AND ?
        WHERE s.site_status = 'Active'${scoped ? ' AND s.site_id = ?' : ''}

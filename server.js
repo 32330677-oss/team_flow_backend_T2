@@ -50,7 +50,8 @@ app.use('/api/attendance', require('./routes/attendanceRoutes'));
 app.use('/api/admin/attendance', adminAttendanceRoutes);
 app.use('/api/admin/payroll', adminPayrollRoutes);
 app.use('/api/transfers', transferRoutes);
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+// C-18: uploads/ is no longer public. Worker photos: GET /api/workers/:id/files/:type (Admin);
+// transfer documents: GET /api/transfers/:id/document (authorized).
 app.use('/api/biometric/attendance', biometricAttendanceAdminRoutes);
 app.use('/api/dashboard', dashboardRoutes);
 app.use('/api/staff', staffRoutes);
@@ -64,9 +65,26 @@ app.get('/health', (req, res) => {
 
 const PORT = process.env.PORT || 5000;
 
-// تشغيل السيرفر على جميع الواجهات ليستقبل الاتصالات من أي جهاز في الشبكة
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Server is running beautifully on Port: ${PORT}`);
-    console.log(`👉 Local: http://localhost:${PORT}`);
-    console.log(`👉 Network check: check your local computer IP to connect your Infinix phone.`);
-});
+// Assignment end-date semantics interlock (requirements §5): the database must
+// carry the 'inclusive_last_day' marker written by
+// migrations/2026_10_hardening/05_data.sql, otherwise every assignment query
+// would be off by one day. Refuse to start instead of computing wrong dates.
+async function start() {
+    const db = require('./config/db');
+    const { assertSemanticsMarker } = require('./services/assignmentDates');
+    try {
+        await assertSemanticsMarker(db);
+    } catch (error) {
+        console.error(`FATAL: ${error.message}`);
+        process.exit(1);
+    }
+    return app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Server is running on port ${PORT}`);
+    });
+}
+
+if (require.main === module) {
+    start();
+}
+
+module.exports = { app, start };

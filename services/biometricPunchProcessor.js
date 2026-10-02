@@ -58,6 +58,23 @@ function classifyOutcome(result) {
   return { status: result.status, result: result.result, error: result.message || null };
 }
 
+// H-06 / §18: append-only processing history (never updated or deleted).
+async function logProcessing(executor, { punchId, event, status, result = null, error = null, mappingId = null,
+  targetTable = null, targetRecordId = null, reason = null, userId = null }) {
+  try {
+    await executor.execute(
+      `INSERT INTO attendance_punch_processing_log
+         (punch_id, event, processing_status, processing_result, processing_error, mapping_id,
+          target_table, target_record_id, reason, user_id)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [punchId, String(event).slice(0, 40), status, result, error ? String(error).slice(0, 2000) : null,
+        mappingId || null, targetTable || null, targetRecordId || null, reason ? String(reason).slice(0, 500) : null, userId || null]
+    );
+  } catch (e) {
+    if (e.code !== 'ER_NO_SUCH_TABLE') throw e;
+  }
+}
+
 /**
  * Processes ONE queue item atomically.
  *
@@ -87,8 +104,8 @@ async function processQueueItem(punchId, {
 
     const [rows] = await connection.execute(
       `SELECT pr.id AS processing_id, pr.processing_status, pr.processing_result, pr.attempts,
-              pr.mapping_id, pr.target_table, pr.target_record_id,
-              p.id AS punch_id, p.device_employee_id, p.punched_at, p.punch_type,
+              pr.mapping_id, pr.target_table, pr.target_record_id, pr.window_override,
+              p.id AS punch_id, p.device_employee_id, p.punched_at, p.punch_type, p.created_at AS received_at,
               b.status AS batch_status
        FROM attendance_punch_processing pr
        JOIN attendance_punches p ON p.id = pr.punch_id
@@ -109,10 +126,11 @@ async function processQueueItem(punchId, {
     }
 
     const result = await biometricAttendanceService.resolvePunch(
-      { device_employee_id: item.device_employee_id, punched_at: item.punched_at, punch_type: item.punch_type },
+      { device_employee_id: item.device_employee_id, punched_at: item.punched_at, punch_type: item.punch_type,
+        received_at: item.received_at },
       userId,
       connection,
-      override
+      { ...override, ignoreWindow: Number(item.window_override) === 1 }
     );
     const classified = classifyOutcome(result);
 
@@ -140,6 +158,13 @@ async function processQueueItem(punchId, {
         punchId,
       ]
     );
+
+    // H-06: every processing outcome is kept (the queue row holds only the latest).
+    await logProcessing(connection, {
+      punchId, event: audit ? audit.actionType : 'PROCESSED', status: classified.status, result: classified.result,
+      error: classified.error, mappingId: result.mappingId, targetTable: result.targetTable,
+      targetRecordId: result.targetRecordId, reason: audit ? audit.reason : null, userId,
+    });
 
     if (audit) {
       await connection.execute(
@@ -188,6 +213,8 @@ async function processQueueItem(punchId, {
            WHERE punch_id = ?`,
           [String(error.message || 'Unknown error').slice(0, 2000), businessNow(), userId, punchId]
         );
+        await logProcessing(db, { punchId, event: 'PROCESSED', status: 'Failed', result: 'exception',
+          error: String(error.message || 'Unknown error'), userId });
       } catch (_) {}
     }
     return { status: 'Failed', result: 'exception', error: String(error.message || 'Unknown error') };
@@ -285,4 +312,5 @@ module.exports = {
   processPendingPunches,
   processQueueItem,
   classifyOutcome,
+  logProcessing,
 };

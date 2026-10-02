@@ -2,6 +2,7 @@ const pool = require('../config/db');
 const { countNonFridayDays, listNonFridayDates, isFriday, round2 } = require('../services/staffAttendanceService');
 const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
 const { buildStaffCompensationTimeline } = require('../services/staffCompensationService');
+const settingsCache = require('../services/settingsCache');
 function isValidDate(value) {
     return /^\d{4}-\d{2}-\d{2}$/.test(String(value || '')) && !Number.isNaN(Date.parse(`${value}T00:00:00`));
 }
@@ -25,6 +26,10 @@ async function generateStaffPayrollBatch(req, res) {
     const { start_date, end_date, acknowledge_pending } = req.body || {};
     const acknowledgePending = acknowledge_pending === true;
     const userId = req.user?.user_id;
+    // D-03: set only by staffPayrollVersioningController.createNewVersion —
+    // the replacement is generated and verified BEFORE the old batch is
+    // superseded, in the same transaction.
+    const supersede = req._supersede || null;
 
     if (!userId) return res.status(401).json({ status: 'error', message: 'Unable to determine user identity' });
     if (!isValidDate(start_date) || !isValidDate(end_date)) {
@@ -39,12 +44,21 @@ async function generateStaffPayrollBatch(req, res) {
         await connection.beginTransaction();
         const [overlap] = await connection.execute(
             `SELECT staff_payroll_batch_id FROM staff_payroll_batches
-             WHERE start_date <= ? AND end_date >= ? AND status <> 'Superseded' LIMIT 1 FOR UPDATE`,
-            [end_date, start_date]
+             WHERE start_date <= ? AND end_date >= ? AND status IN ('Generated','Paid')
+               AND staff_payroll_batch_id <> ? LIMIT 1 FOR UPDATE`,
+            [end_date, start_date, supersede ? supersede.batchId : 0]
         );
         if (overlap.length) {
             await connection.rollback();
             return res.status(409).json({ status: 'error', message: 'A payroll batch overlapping with this period already exists' });
+        }
+        if (supersede) {
+            const [[old]] = await connection.execute(
+                'SELECT status, start_date, end_date FROM staff_payroll_batches WHERE staff_payroll_batch_id = ? FOR UPDATE', [supersede.batchId]);
+            if (!old || old.status !== 'Generated') {
+                await connection.rollback();
+                return res.status(409).json({ status: 'error', message: 'The batch to supersede is no longer active (or is Paid).' });
+            }
         }
 
 
@@ -83,13 +97,14 @@ const [prev] = await connection.execute(
   [start_date, end_date]
 );
 const nextVersion = prev.length ? prev[0].version_number + 1 : 1;
-const supersedesId = prev.length ? prev[0].staff_payroll_batch_id : null;
+const supersedesId = supersede ? supersede.batchId : (prev.length ? prev[0].staff_payroll_batch_id : null);
+const staffCurrency = String(await settingsCache.getSetting('staff_payroll_currency', 'USD') || 'USD').toUpperCase();
 
 const [batchResult] = await connection.execute(
   `INSERT INTO staff_payroll_batches
-     (start_date, end_date, generated_by_user_id, status, version_number, supersedes_batch_id)
-   VALUES (?, ?, ?, 'Generated', ?, ?)`,
-  [start_date, end_date, userId, nextVersion, supersedesId]
+     (start_date, end_date, generated_by_user_id, status, version_number, supersedes_batch_id, currency, supersede_reason)
+   VALUES (?, ?, ?, 'Generated', ?, ?, ?, ?)`,
+  [start_date, end_date, userId, nextVersion, supersedesId, staffCurrency, supersede ? supersede.reason : null]
 );
         const batchId = batchResult.insertId;
         let totalStaff = 0;
@@ -466,17 +481,35 @@ const hourlyRate       = money(hourlyRateRaw); // هاد بس للعرض/الت�
             [totalStaff, totalAmount, batchId]
         );
 
+        if (supersede) {
+            // Verified replacement exists -> supersede the old batch (same transaction).
+            const [[check]] = await connection.execute(
+                'SELECT COUNT(*) AS cnt FROM staff_payroll WHERE staff_payroll_batch_id = ?', [batchId]);
+            if (Number(check.cnt) !== totalStaff) throw new Error('Replacement verification failed.');
+            await connection.execute(
+                `UPDATE staff_payroll_batches SET status = 'Superseded' WHERE staff_payroll_batch_id = ? AND status = 'Generated'`,
+                [supersede.batchId]);
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('staff_payroll_batches', ?, 'SUPERSEDED', ?, ?, ?)`,
+                [supersede.batchId, userId, JSON.stringify({ status: 'Generated' }),
+                    JSON.stringify({ status: 'Superseded', replaced_by_batch_id: batchId, reason: supersede.reason })]);
+        }
+
         await connection.commit();
         return res.status(201).json({
             status: 'success',
-            message: 'Staff payroll batch generated successfully',
+            message: supersede
+                ? `Replacement batch #${batchId} (version ${nextVersion}) generated; batch #${supersede.batchId} is now Superseded.`
+                : 'Staff payroll batch generated successfully',
             batch_id: batchId,
+            currency: staffCurrency,
             ...(segmentAudits.length ? { compensation_segments: segmentAudits } : {}),
         });
     } catch (error) {
         await connection.rollback();
         console.error('generateStaffPayrollBatch:', error);
-        return res.status(500).json({ status: 'error', message: 'Failed to generate payroll batch' });
+        return res.status(500).json({ status: 'error', message: 'Failed to generate payroll batch. No batch was changed.' });
     } finally {
         connection.release();
     }
@@ -487,6 +520,8 @@ async function getStaffPayrollReport(req, res) {
         const [rows] = await pool.execute(
             `SELECT spb.staff_payroll_batch_id, spb.start_date, spb.end_date,
                     spb.total_staff, spb.total_amount, spb.status, spb.generated_at,
+                    spb.version_number, spb.is_finalized, spb.finalized_at, spb.currency,
+                    spb.supersedes_batch_id, spb.void_reason, spb.supersede_reason,
                     u.full_name AS generated_by
              FROM staff_payroll_batches spb
              JOIN users u ON u.user_id = spb.generated_by_user_id
@@ -536,9 +571,9 @@ if (!batches.length) {
     await connection.rollback();
     return res.status(404).json({ status: 'error', message: 'Payroll batch not found' });
 }
-if (batches[0].status === 'Superseded') {
+if (batches[0].status === 'Superseded' || batches[0].status === 'Voided') {
     await connection.rollback();
-    return res.status(409).json({ status: 'error', message: 'A superseded batch cannot be marked as paid' });
+    return res.status(409).json({ status: 'error', message: `A ${batches[0].status.toLowerCase()} batch cannot be marked as paid` });
 }
 if (batches[0].status === 'Paid') {
     await connection.rollback();
@@ -548,7 +583,13 @@ if (!batches[0].is_finalized) {
     await connection.rollback();
     return res.status(409).json({ status: 'error', message: 'Finalize this payroll batch before marking it as paid.' });
 }
-await connection.execute(`UPDATE staff_payroll_batches SET status = 'Paid' WHERE staff_payroll_batch_id = ?`, [batchId]);
+// C-09: who marked it paid and when.
+await connection.execute(`UPDATE staff_payroll_batches SET status = 'Paid', paid_by_user_id = ?, paid_at = NOW() WHERE staff_payroll_batch_id = ?`, [req.user?.user_id, batchId]);
+await connection.execute(
+    `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+     VALUES ('staff_payroll_batches', ?, 'MARKED_PAID', ?, ?, ?)`,
+    [batchId, req.user?.user_id, JSON.stringify({ status: batches[0].status }), JSON.stringify({ status: 'Paid' })]
+);
         await connection.commit();
         return res.json({ status: 'success', message: 'Payroll batch marked as paid successfully' });
     } catch (error) {
@@ -637,7 +678,7 @@ sheet.columns = [
         sheet.getCell('A1').value =
             `Staff Payroll Batch #${batchId} (v${batch.version_number || 1}) — ${finalizedLabel}`;
         sheet.mergeCells('A2:R2');
-        sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)}  →  ${dateOnly(batch.end_date)}`;
+        sheet.getCell('A2').value = `Period: ${dateOnly(batch.start_date)}  →  ${dateOnly(batch.end_date)}   |   Currency: ${batch.currency || 'USD'}`;
         sheet.mergeCells('A3:R3');
         sheet.getCell('A3').value =
             `Status: ${statusLabel}   |   Generated By: ${batch.generated_by || '-'}` +
@@ -854,7 +895,7 @@ async function exportStaffPayrollPdf(req, res) {
             doc.font('Helvetica-Bold').fontSize(10);
             doc.text(`Batch #${batchId}  (Version ${batch.version_number || 1})`, doc.page.margins.left, cursorY);
             doc.text(
-                `Period: ${dateOnly(batch.start_date)}   to   ${dateOnly(batch.end_date)}`,
+                `Period: ${dateOnly(batch.start_date)}   to   ${dateOnly(batch.end_date)}   |   Currency: ${batch.currency || 'USD'}`,
                 doc.page.margins.left, cursorY, { width: pageWidth, align: 'right' }
             );
             cursorY += 16;

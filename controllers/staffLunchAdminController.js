@@ -13,6 +13,7 @@
 //        { date, staff_attendance_ids: [..], remove: true }
 
 const db = require('../config/db');
+const { findLockedStaffBatch } = require('../services/payrollLock');
 const { calculateStaffShiftHours, isValidDateOnly } = require('../services/staffAttendanceService');
 const { getStaffCompensationForDate } = require('../services/staffCompensationService');
 
@@ -73,6 +74,9 @@ exports.applyLunch = async (req, res) => {
   const results = { updated: [], skipped: [] };
   try {
     await connection.beginTransaction();
+    if (await findLockedStaffBatch(connection, { date })) {
+      throw Object.assign(new Error(`${date} is inside a finalized/paid staff payroll period; lunch can no longer be changed here.`), { isOperational: true, statusCode: 409 });
+    }
     for (const rawId of [...new Set(ids.map(Number))]) {
       const [[rec]] = await connection.execute(
         'SELECT * FROM staff_attendance WHERE staff_attendance_id = ? FOR UPDATE', [rawId]);
@@ -143,6 +147,7 @@ exports.applyLunch = async (req, res) => {
     });
   } catch (error) {
     try { await connection.rollback(); } catch (_) {}
+    if (error.isOperational) return res.status(error.statusCode || 400).json({ status: 'error', message: error.message });
     console.error('APPLY STAFF LUNCH ERROR:', error);
     return res.status(500).json({ status: 'error', message: 'Failed to apply lunch.' });
   } finally {

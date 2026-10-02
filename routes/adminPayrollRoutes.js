@@ -18,6 +18,8 @@ router.get('/monthly-report.xlsx', monthlyReport.exportWorkerMonthlyReport);
 router.get('/monthly-report.pdf', monthlyReport.exportWorkerMonthlyReportPdf);
 router.patch('/batch/:batchId/mark-paid', controller.markBatchAsPaid);
 router.patch('/batch/:batchId/finalize', controller.finalizePayrollBatch);
+router.patch('/batch/:batchId/void', controller.voidPayrollBatch);
+router.post('/batch/:batchId/supersede', controller.supersedeFinalizedBatch);
 router.get('/batch/:batchId/versions', controller.getPayrollVersionChain);
 router.get('/last-date', controller.getLastBatchEndDate);
 

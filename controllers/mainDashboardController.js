@@ -8,7 +8,7 @@
 // Read-only. Every figure comes from existing tables and follows the rules the
 // rest of the system already applies:
 //   * An assignment is effective on date D when
-//       assigned_date <= D AND (unassigned_date IS NULL OR unassigned_date > D)
+//       assigned_date <= D AND (unassigned_date IS NULL OR unassigned_date >= D)
 //     (unassigned_date is an EXCLUSIVE end: attendance, submitDay, payroll).
 //   * "Expected" = Active workers with an effective assignment to an Active
 //     site for that site + shift on D. There is no work calendar and no shift
@@ -73,7 +73,7 @@ function resolveDate(raw) {
 
 function rulesPayload() {
   return {
-    expected_workers: 'Active workers with an assignment effective on the date (assigned_date <= date < unassigned_date) to an Active site, counted per site and shift.',
+    expected_workers: 'Active workers with an assignment effective on the date (assigned_date <= date <= unassigned_date, the last assigned day) to an Active site, counted per site and shift.',
     record_for_date: 'Record dated today; otherwise a record from yesterday that is still open (Draft, checked in, not checked out) or that crossed midnight.',
     overdue_draft: 'Draft records dated before today (Night shift: before yesterday) — the supervisor has not submitted that day.',
     supervisor_required: 'Shift sites need an Active Supervisor in site_shifts for the shift; non-shift sites need sites.supervisor_id to be an Active Supervisor.',
@@ -118,7 +118,7 @@ function workerStateSql(siteFilterSql) {
         ORDER BY (a2.record_date = ?) DESC, a2.attendance_id DESC
         LIMIT 1)
     WHERE wsa.assigned_date <= ?
-      AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
+      AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ?)
       ${siteFilterSql}`;
 }
 
@@ -206,7 +206,7 @@ async function loadSiteData(date, siteId) {
         JOIN workers w2 ON w2.worker_id = wsa.worker_id AND w2.status = 'Active'
         WHERE wsa.worker_id = a.worker_id AND wsa.site_id = a.site_id AND wsa.shift_type = a.shift_type
           AND wsa.assigned_date <= a.record_date
-          AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > a.record_date))
+          AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= a.record_date))
     ORDER BY w.full_name
     LIMIT 500`;
 
@@ -724,7 +724,7 @@ async function loadIntegrityGlobal(date) {
        FROM workersiteassignments wsa
        JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
        JOIN sites s ON s.site_id = wsa.site_id
-       WHERE wsa.assigned_date <= ? AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
+       WHERE wsa.assigned_date <= ? AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ?)
        GROUP BY w.worker_id, w.full_name
        HAVING COUNT(*) > 1
        ORDER BY w.full_name
@@ -736,7 +736,7 @@ async function loadIntegrityGlobal(date) {
        FROM workersiteassignments wsa
        JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
        JOIN sites s ON s.site_id = wsa.site_id AND s.site_status <> 'Active'
-       WHERE wsa.assigned_date <= ? AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
+       WHERE wsa.assigned_date <= ? AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ?)
        GROUP BY s.site_id, s.site_name, s.site_status
        ORDER BY s.site_name`,
       [date, date]

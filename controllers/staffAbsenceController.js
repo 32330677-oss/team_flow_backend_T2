@@ -17,6 +17,7 @@
 //   router.post('/admin/absences/unmark-paid', restrictTo('Admin'), staffAbsenceController.unmarkAbsencePaid);
 
 const db = require('../config/db');
+const { findLockedStaffBatch } = require('../services/payrollLock');
 const { getActiveSpansOverlapping } = require('../services/staffEmploymentService');
 
 function isValidDateOnly(value) {
@@ -144,6 +145,11 @@ exports.markAbsencesPaid = async (req, res) => {
                 skipped.push({ staff_attendance_id: id, reason: 'Already marked as management-paid.' });
                 continue;
             }
+            const [[dateRow]] = await connection.execute('SELECT record_date FROM staff_attendance WHERE staff_attendance_id = ?', [id]);
+            if (await findLockedStaffBatch(connection, { date: String(dateRow.record_date).slice(0, 10) })) {
+                skipped.push({ staff_attendance_id: id, reason: 'The date is inside a finalized/paid staff payroll period (use Correct attendance).' });
+                continue;
+            }
 
             await connection.execute(
                 `UPDATE staff_attendance
@@ -207,6 +213,11 @@ exports.unmarkAbsencePaid = async (req, res) => {
             const record = rows[0];
             if (Number(record.is_management_paid_absence) !== 1) {
                 skipped.push({ staff_attendance_id: id, reason: 'Record is not currently management-paid.' });
+                continue;
+            }
+            const [[dateRow2]] = await connection.execute('SELECT record_date FROM staff_attendance WHERE staff_attendance_id = ?', [id]);
+            if (await findLockedStaffBatch(connection, { date: String(dateRow2.record_date).slice(0, 10) })) {
+                skipped.push({ staff_attendance_id: id, reason: 'The date is inside a finalized/paid staff payroll period (use Correct attendance).' });
                 continue;
             }
 

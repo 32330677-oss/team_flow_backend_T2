@@ -80,4 +80,40 @@ async function recordWorkerStatusChange(executor, {
   );
 }
 
-module.exports = { getWorkerStatusOnDate, getLastStatusChange, recordWorkerStatusChange };
+/**
+ * C-12: the subset of workerIds whose HISTORICAL status on `date` is Active.
+ * Replaces the old `workers.status = 'Active'` (today's status) filter in the
+ * manual attendance paths. One query for current status + one for history.
+ */
+async function getActiveWorkerIdsOnDate(workerIds, date, executor = db) {
+  const ids = [...new Set((workerIds || []).map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (ids.length === 0) return new Set();
+  const [workers] = await executor.query(
+    'SELECT worker_id, status FROM workers WHERE worker_id IN (?)', [ids]);
+  const [history] = await executor.query(
+    `SELECT worker_id, old_status, new_status, DATE_FORMAT(effective_date, '%Y-%m-%d') AS effective_date
+     FROM worker_status_history WHERE worker_id IN (?)
+     ORDER BY worker_id, effective_date ASC, status_history_id ASC`, [ids]);
+  const byWorker = new Map();
+  for (const h of history) {
+    if (!byWorker.has(h.worker_id)) byWorker.set(h.worker_id, []);
+    byWorker.get(h.worker_id).push(h);
+  }
+  const active = new Set();
+  for (const w of workers) {
+    const rows = byWorker.get(w.worker_id);
+    if (!rows || rows.length === 0) {
+      if (w.status === 'Active') active.add(w.worker_id);
+      continue;
+    }
+    let status = rows[0].old_status || null;
+    for (const r of rows) {
+      if (r.effective_date <= date) status = r.new_status;
+      else break;
+    }
+    if (status === 'Active') active.add(w.worker_id);
+  }
+  return active;
+}
+
+module.exports = { getWorkerStatusOnDate, getLastStatusChange, recordWorkerStatusChange, getActiveWorkerIdsOnDate };

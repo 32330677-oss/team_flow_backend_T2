@@ -34,8 +34,15 @@ const { isEmployedOnDate } = require('./staffEmploymentService');
 const { getWorkerStatusOnDate } = require('./workerStatusService');
 const { getStaffCompensationForDate } = require('./staffCompensationService');
 const { businessToday, addDays } = require('./businessDate');
+const { activeOn } = require('./assignmentDates');
+const { getSiteStatusOnDate } = require('./siteStatusService');
+const { findLockedWorkerBatch, findLockedStaffBatch } = require('./payrollLock');
+const anomalyService = require('./anomalyService');
 
-// Technical data-retention window (unchanged from Phase 1, not a shift rule).
+// Technical import window (not a shift rule, not a payroll rule).
+// §19: measured from punched_at to the date the punch was RECEIVED (imported),
+// so a delay in processing never turns a valid punch into an Invalid one.
+// An Admin can restore an Invalid punch with a reason (D-04, window_override).
 const MAX_PUNCH_AGE_DAYS = Math.max(1, Number(process.env.BIOMETRIC_MAX_PUNCH_AGE_DAYS) || 30);
 
 const TABLES = {
@@ -46,8 +53,11 @@ const TABLES = {
 // Human-readable explanation for every result code (stored in processing_error
 // for NeedsReview/Invalid items so the Daily Review can show it as-is).
 const MESSAGES = {
-  future_punch: 'The punch date is in the future (check the device clock).',
-  punch_too_old: `The punch is older than the allowed window (${MAX_PUNCH_AGE_DAYS} days).`,
+  future_punch: 'The punch time is in the future (check the device clock). Retry once that time has passed.',
+  punch_too_old: `The punch was imported more than ${MAX_PUNCH_AGE_DAYS} days after it happened. An Admin can restore it for processing with a reason.`,
+  long_duration: 'Closing the open session with this OUT would create an unusually long shift. Check for a missing OUT / IN before deciding.',
+  payroll_period_finalized: 'The punch date is inside a finalized/paid payroll period. Attendance there is locked; use the Admin correction workflow.',
+  site_status_unknown: 'The site is not Active today and has no status history, so its status on the punch date is unknown.',
   unmapped: 'The device employee ID is not mapped to a worker/staff member on the punch date.',
   worker_inactive_on_date: 'The worker was Inactive on the punch date (worker status history).',
   worker_status_unknown: 'The worker is currently Inactive and has no status history, so the status on the punch date is unknown.',
@@ -103,10 +113,34 @@ const toWall = (value) => String(value).replace('T', ' ').slice(0, 19);
 const sameWall = (a, b) => a !== null && a !== undefined && toWall(a) === toWall(b);
 const dateOf = (value) => String(value).slice(0, 10);
 
-function checkPunchWindow(punchDate) {
-  const today = businessToday();
-  if (punchDate > today) return 'future_punch';
-  if (punchDate < addDays(today, -MAX_PUNCH_AGE_DAYS)) return 'punch_too_old';
+function businessNowWall() {
+  const timeZone = process.env.APP_TIME_ZONE || 'Asia/Beirut';
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date());
+  const v = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${v.year}-${v.month}-${v.day} ${v.hour}:${v.minute}:${v.second}`;
+}
+
+// Returns 'future_punch' | 'punch_too_old' | null.
+//   future: punched_at later than now (+5 min clock tolerance) -> NeedsReview
+//           (retriable once the time has passed; never permanently Invalid)
+//   too old: received (imported) more than MAX_PUNCH_AGE_DAYS days after
+//           punched_at -> Invalid unless an Admin restored it (D-04)
+function checkPunchWindow(punchWall, receivedDate = null, ignoreAge = false) {
+  const now = businessNowWall();
+  const [d, t] = now.split(' ');
+  const [y, mo, da] = d.split('-').map(Number);
+  const [h, mi] = t.split(':').map(Number);
+  const tol = new Date(Date.UTC(y, mo - 1, da, h, mi + 5));
+  const pad = (n) => String(n).padStart(2, '0');
+  const nowPlus = `${tol.getUTCFullYear()}-${pad(tol.getUTCMonth() + 1)}-${pad(tol.getUTCDate())} ${pad(tol.getUTCHours())}:${pad(tol.getUTCMinutes())}:00`;
+  if (punchWall > nowPlus) return 'future_punch';
+  if (!ignoreAge) {
+    const reference = receivedDate || businessToday();
+    if (punchWall.slice(0, 10) < addDays(reference, -MAX_PUNCH_AGE_DAYS)) return 'punch_too_old';
+  }
   return null;
 }
 
@@ -146,12 +180,14 @@ async function latestSessionBefore(kind, ownerId, punchWall, executor) {
   return rows[0] || null;
 }
 
-async function getSiteStatus(siteId, executor) {
-  const [[site]] = await executor.execute(
-    'SELECT site_id, site_name, site_status FROM sites WHERE site_id = ? LIMIT 1',
-    [siteId]
-  );
-  return site || null;
+// D-05: the site status that applied on the punch date (site_status_history).
+async function siteCheck(siteId, date, executor) {
+  const r = await getSiteStatusOnDate(siteId, date, executor);
+  if (r.status === 'Active') return null;
+  if (r.status === 'Unknown') {
+    return { result: 'site_status_unknown', message: `Site "${r.site ? r.site.site_name : siteId}" is ${r.site ? r.site.site_status : 'missing'} today and has no status history, so its status on ${date} is unknown.` };
+  }
+  return { result: 'site_not_active', message: `Site "${r.site ? r.site.site_name : siteId}" was ${r.status} on ${date}.` };
 }
 
 // ---------------- Worker helpers ----------------
@@ -164,7 +200,7 @@ async function resolveWorkerAssignment(workerId, punchDate, executor = db) {
      FROM workersiteassignments wsa
      WHERE wsa.worker_id = ?
        AND wsa.assigned_date <= ?
-       AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
+       AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ?)
      ORDER BY wsa.assigned_date DESC`,
     [workerId, punchDate, punchDate]
   );
@@ -182,7 +218,7 @@ async function staffSiteOnDate(staffId, date, executor) {
   const [rows] = await executor.execute(
     `SELECT site_id FROM staff_site_assignments
      WHERE staff_id = ? AND assigned_date <= ?
-       AND (unassigned_date IS NULL OR unassigned_date > ?)
+       AND (unassigned_date IS NULL OR unassigned_date >= ?)
      ORDER BY assigned_date DESC LIMIT 1`,
     [staffId, date, date]
   );
@@ -277,11 +313,11 @@ async function workerIn(workerId, punchWall, userId, executor, override) {
   if (assignment.none) return outcome('NeedsReview', 'no_assignment');
   if (assignment.multiple) return outcome('NeedsReview', 'multiple_assignments');
 
-  const site = await getSiteStatus(assignment.siteId, executor);
-  if (!site || site.site_status !== 'Active') {
-    return outcome('NeedsReview', 'site_not_active', {
-      message: `Site ${site ? `"${site.site_name}"` : assignment.siteId} is ${site ? site.site_status : 'missing'}.`,
-    });
+  const siteIssue = await siteCheck(assignment.siteId, punchDate, executor);
+  if (siteIssue) return outcome('NeedsReview', siteIssue.result, { message: siteIssue.message });
+
+  if (await findLockedWorkerBatch(executor, { siteId: assignment.siteId, date: punchDate })) {
+    return outcome('NeedsReview', 'payroll_period_finalized');
   }
 
   const [rows] = await executor.execute(
@@ -326,19 +362,18 @@ async function staffIn(staffId, punchWall, userId, executor, override) {
   const [sup] = await executor.execute(
     `SELECT 1 FROM staff_supervisor_assignments
      WHERE staff_id = ? AND assigned_date <= ?
-       AND (unassigned_date IS NULL OR unassigned_date > ?) LIMIT 1`,
+       AND (unassigned_date IS NULL OR unassigned_date >= ?) LIMIT 1`,
     [staffId, punchDate, punchDate]
   );
   if (!sup.length) return outcome('NeedsReview', 'no_supervisor_assignment');
 
   const siteId = await staffSiteOnDate(staffId, punchDate, executor);
   if (siteId) {
-    const site = await getSiteStatus(siteId, executor);
-    if (!site || site.site_status !== 'Active') {
-      return outcome('NeedsReview', 'site_not_active', {
-        message: `Staff site ${site ? `"${site.site_name}"` : siteId} is ${site ? site.site_status : 'missing'}.`,
-      });
-    }
+    const siteIssue = await siteCheck(siteId, punchDate, executor);
+    if (siteIssue) return outcome('NeedsReview', siteIssue.result, { message: siteIssue.message });
+  }
+  if (await findLockedStaffBatch(executor, { date: punchDate })) {
+    return outcome('NeedsReview', 'payroll_period_finalized');
   }
 
   const [rows] = await executor.execute(
@@ -422,11 +457,31 @@ async function applyOut(kind, ownerId, punchWall, executor, override) {
     return outcome('NeedsReview', 'out_far_from_session', target);
   }
 
+  // D-02: never change attendance inside a finalized/paid payroll period.
+  const lockedBatch = kind === 'Worker'
+    ? await findLockedWorkerBatch(executor, { siteId: rec.site_id, date: sessionDate })
+    : await findLockedStaffBatch(executor, { date: sessionDate });
+  if (lockedBatch) {
+    if (override.useAsCheckout) throw serviceError(MESSAGES.payroll_period_finalized, 409);
+    return outcome('NeedsReview', 'payroll_period_finalized', target);
+  }
+
+  // D-09 / §11: duration is a warning signal only. An automatic OUT never
+  // closes a session that would become unreasonably long (e.g. Sunday IN with
+  // no OUT, closed by Monday's OUT ~30 h later): the punch goes to Needs Review
+  // and an Admin decides (Use as Checkout applies it explicitly, flagged).
+  if (!override.useAsCheckout) {
+    const longCheck = await anomalyService.evaluateSession(toWall(rec.check_in_time), punchWall, sessionDate);
+    if (longCheck) {
+      return outcome('NeedsReview', 'long_duration', { ...target, message: `${MESSAGES.long_duration} ${longCheck.detail}` });
+    }
+  }
+
   if (kind === 'Worker') {
-    const site = await getSiteStatus(rec.site_id, executor);
-    if (!site || site.site_status !== 'Active') {
-      if (override.useAsCheckout) throw serviceError('The session\'s site is not Active.', 409);
-      return outcome('NeedsReview', 'site_not_active', target);
+    const siteIssue = await siteCheck(rec.site_id, sessionDate, executor);
+    if (siteIssue) {
+      if (override.useAsCheckout) throw serviceError(siteIssue.message, 409);
+      return outcome('NeedsReview', siteIssue.result, { ...target, message: siteIssue.message });
     }
     const [[openLeave]] = await executor.execute(
       'SELECT leave_id FROM attendanceleaveperiods WHERE attendance_id = ? AND leave_end_time IS NULL LIMIT 1',
@@ -455,6 +510,8 @@ async function applyOut(kind, ownerId, punchWall, executor, override) {
         [punchWall, id]
       );
       await writeStaffHours(rec, inWall, punchWall, executor);
+      const staffAnomaly = await anomalyService.evaluateSession(inWall, punchWall, sessionDate);
+      await anomalyService.applyAnomalyFlag(executor, 'staff_attendance', 'staff_attendance_id', id, staffAnomaly);
     }
     await executor.query('RELEASE SAVEPOINT bio_out');
   } catch (calcError) {
@@ -488,7 +545,9 @@ async function resolvePunch(punch, recordedByUserId, executor, override = {}) {
   }
 
   const punchWall = toWall(punch.punched_at);
-  const windowIssue = checkPunchWindow(punchWall.slice(0, 10));
+  const receivedDate = punch.received_at ? String(punch.received_at).slice(0, 10) : null;
+  const windowIssue = checkPunchWindow(punchWall, receivedDate, override.ignoreWindow === true);
+  if (windowIssue === 'future_punch') return outcome('NeedsReview', 'future_punch');
   if (windowIssue) return outcome('Invalid', windowIssue);
 
   const mapping = await biometricDeviceUserService.resolveDeviceUser(

@@ -21,6 +21,8 @@ router.post('/items/:punchId/keep-as-new-in', review.keepAsNewIn);
 router.post('/items/:punchId/mark-duplicate', review.markDuplicate);
 router.post('/items/:punchId/review-later', review.reviewLater);
 router.post('/items/:punchId/requeue', review.requeueItem);
+router.post('/items/:punchId/restore', review.restoreInvalidItem);
+router.get('/items/:punchId/history', review.getItemHistory);
 router.get('/mapping-impact/:mappingId', review.getMappingImpact);
 router.post('/batches/:batchId/close', review.closeStaleBatch);
 router.post('/records/submit-for-review', review.adminSubmitForReview);

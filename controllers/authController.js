@@ -43,10 +43,16 @@ exports.login = async (req, res) => {
 
         // 4. Flexible password verification (supports old and new hashes to prevent locking admin accounts)
         let isMatch = false;
+        let legacyPlaintext = false;
         if (user.password_hash.startsWith('$2a$') || user.password_hash.startsWith('$2b$')) {
             isMatch = await bcrypt.compare(password, user.password_hash);
         } else {
-            isMatch = (password === user.password_hash);
+            // R-10: legacy rows stored without a hash. Compare in constant time and
+            // re-hash immediately on success so the plaintext disappears from the DB.
+            const a = Buffer.from(String(password));
+            const b = Buffer.from(String(user.password_hash));
+            isMatch = a.length === b.length && crypto.timingSafeEqual(a, b);
+            legacyPlaintext = isMatch;
         }
 
         if (!isMatch) {
@@ -72,6 +78,10 @@ exports.login = async (req, res) => {
 
         // 6. Update last login time in the database
         await db.query('UPDATE users SET last_login = NOW() WHERE user_id = ?', [user.user_id]);
+        if (legacyPlaintext) {
+            const upgraded = await bcrypt.hash(password, 10);
+            await db.query('UPDATE users SET password_hash = ? WHERE user_id = ?', [upgraded, user.user_id]);
+        }
 
         // 7. Log successful login attempt in loginhistory (success = 1) with device_id
         await db.query(
@@ -98,8 +108,7 @@ exports.login = async (req, res) => {
         console.error("🚨 Login Server Error:", error);
         res.status(500).json({ 
             status: "error", 
-            message: "A server error occurred while processing login", 
-            details: error.message 
+            message: "A server error occurred while processing login"
         });
     }
 };

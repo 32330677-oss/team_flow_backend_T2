@@ -1,5 +1,6 @@
 const db = require('../config/db');
 const settingsCache = require('./settingsCache');
+const anomalyService = require('./anomalyService');
 
 function parseWallClockDateTime(value) {
     if (!value) return null;
@@ -100,15 +101,24 @@ if (standard_minutes_snapshot !== null) {
     );
 }
 
-const regularHours = Math.min(999.99, Math.min(totalMinutes, standardMinutes) / 60);
-const overtimeHours = Math.min(99.99, Math.max(0, totalMinutes - standardMinutes) / 60);
+// §13: overtime is no longer clamped to 99.99 (the column is DECIMAL(6,2) after
+// the 2026-10 migration). An unreasonable duration is NOT hidden or truncated:
+// it is stored as calculated and flagged for review (anomaly_code) below.
+const regularHours = Math.min(totalMinutes, standardMinutes) / 60;
+const overtimeHours = Math.max(0, totalMinutes - standardMinutes) / 60;
+if (regularHours > 9999.99 || overtimeHours > 9999.99) {
+    throw new Error('Calculated hours exceed the storable range; check the check-in/check-out times.');
+}
 
 await executor.execute(
     `UPDATE attendance SET total_working_hours = ?, overtime_hours = ? WHERE attendance_id = ?`,
     [regularHours.toFixed(2), overtimeHours.toFixed(2), attendance_id]
 );
 
-    console.log(`Calculation: ID=${attendance_id}, record_date=${String(record_date).slice(0, 10)}, regular=${regularHours.toFixed(2)}, overtime=${overtimeHours.toFixed(2)}`);
+// D-09: duration is a warning signal only (never decides the shift).
+const anomaly = await anomalyService.evaluateSession(check_in_time, check_out_time, recordDateStr);
+await anomalyService.applyAnomalyFlag(executor, 'attendance', 'attendance_id', attendance_id, anomaly);
+return { regularHours, overtimeHours, anomaly };
 };
 
 exports.parseWallClockDateTime = parseWallClockDateTime;

@@ -25,6 +25,12 @@ router.get('/admin/absences', restrictTo('Admin'), staffAbsenceController.getAbs
 router.post('/admin/absences/mark-paid', restrictTo('Admin'), staffAbsenceController.markAbsencesPaid);
 router.post('/admin/absences/unmark-paid', restrictTo('Admin'), staffAbsenceController.unmarkAbsencePaid);
 
+// D-11: explicit Mark as Paid / Unpaid for Sick / Vacation / Holiday (audited)
+router.post('/admin/:id/paid', restrictTo('Admin'), staffAttendanceController.setPaidDecision);
+// D-02: explicit Admin correction (finalized periods / approved records)
+const correctionController = require('../controllers/attendanceCorrectionController');
+router.post('/admin/:id/correction', restrictTo('Admin'), correctionController.correctStaffAttendance);
+
 // ==================== B4: Lunch for biometric staff records (Admin) ====================
 const staffLunchAdminController = require('../controllers/staffLunchAdminController');
 router.get('/admin/lunch', restrictTo('Admin'), staffLunchAdminController.getLunchDay);

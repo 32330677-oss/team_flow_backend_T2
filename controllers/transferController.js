@@ -2,7 +2,8 @@ const db = require('../config/db');
 const path = require('path');
 const fs = require('fs');
 const { generateTransferRequestDocx } = require('../services/transferDocumentService');
-const { businessToday, isValidDateOnly } = require('../services/businessDate');
+const { businessToday, isValidDateOnly, addDays } = require('../services/businessDate');
+const { overlaps } = require('../services/assignmentDates');
 
 class TransferError extends Error {
     constructor(message, statusCode = 400, extra = null) {
@@ -43,8 +44,12 @@ exports.createTransferRequest = async (req, res) => {
         return res.status(400).json({ status: 'error', message: 'Please specify the worker, current site, and target site.' });
     }
 
-    if (current_site_id === target_site_id && current_shift_type === target_shift_type) {
+    if (Number(current_site_id) === Number(target_site_id) && current_shift_type === target_shift_type) {
         return res.status(400).json({ status: 'error', message: 'The target site/shift cannot be the same as the current one.' });
+    }
+    const requestReason = String(transfer_reason || req.body.request_reason || '').trim();
+    if (requestReason.length < 3) {
+        return res.status(400).json({ status: 'error', message: 'A transfer reason is required.' });
     }
 
     try {
@@ -53,6 +58,17 @@ exports.createTransferRequest = async (req, res) => {
             if (!isAuthorized) {
                 return res.status(403).json({ status: 'error', message: 'You are not authorized to transfer workers from this site/shift.' });
             }
+        }
+
+        // R-13: the target must be an Active site that supports the requested shift.
+        const [[targetSiteCheck]] = await db.query(
+            'SELECT site_status, supports_shifts, site_name FROM sites WHERE site_id = ? LIMIT 1', [target_site_id]);
+        if (!targetSiteCheck) return res.status(404).json({ status: 'error', message: 'Target site not found.' });
+        if (targetSiteCheck.site_status !== 'Active') {
+            return res.status(409).json({ status: 'error', message: `Target site "${targetSiteCheck.site_name}" is ${targetSiteCheck.site_status}.` });
+        }
+        if (target_shift_type === 'Night' && Number(targetSiteCheck.supports_shifts) !== 1) {
+            return res.status(409).json({ status: 'error', message: `Target site "${targetSiteCheck.site_name}" has no Night shift.` });
         }
 
         const [existing] = await db.query(
@@ -68,10 +84,10 @@ exports.createTransferRequest = async (req, res) => {
             [result] = await db.query(
                 `INSERT INTO worker_transfer_requests
                  (worker_id, current_site_id, current_shift_type, target_site_id, target_shift_type,
-                  requested_by_user_id, status, admin_notes, effective_date, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?, ?, NOW(), NOW())`,
+                  requested_by_user_id, status, request_reason, effective_date, transfer_type, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, 'Pending', ?, ?, 'Request', NOW(), NOW())`,
                 [worker_id, current_site_id, current_shift_type, target_site_id, target_shift_type,
-                 requested_by_user_id, transfer_reason || null, effective_date]
+                 requested_by_user_id, requestReason, effective_date]
             );
         } catch (insertError) {
             if (insertError.code === 'ER_DUP_ENTRY' || insertError.errno === 1062) {
@@ -117,7 +133,7 @@ exports.createTransferRequest = async (req, res) => {
                 contractName: currentSiteRow?.contract_name,
                 requesterName: requesterRow?.full_name,
                 requesterPosition: requesterRow?.role,
-                transferReason: transfer_reason,
+                transferReason: requestReason,
             });
 
             await db.query(
@@ -145,7 +161,7 @@ exports.getPendingTransfers = async (req, res) => {
     try {
         const [rows] = await db.query(
             `SELECT
-                t.request_id, t.status, t.admin_notes, t.created_at, t.document_path,
+                t.request_id, t.status, t.admin_notes, t.request_reason, t.created_at, t.document_path,
                 t.current_shift_type, t.target_shift_type,
                 DATE_FORMAT(t.effective_date, '%Y-%m-%d') AS effective_date,
                 w.worker_id, w.full_name AS worker_name,
@@ -164,6 +180,41 @@ exports.getPendingTransfers = async (req, res) => {
     } catch (error) {
         console.error('FETCH PENDING TRANSFERS ERROR:', error);
         res.status(500).json({ status: 'error', message: 'An error occurred while fetching transfer requests.' });
+    }
+};
+
+// 2b. Transfer history (Pending / Approved / Rejected, Request and Direct).
+// GET /api/transfers?status=&type=&q=&limit=
+exports.listTransfers = async (req, res) => {
+    try {
+        const where = [];
+        const params = [];
+        if (['Pending', 'Approved', 'Rejected'].includes(req.query.status)) { where.push('t.status = ?'); params.push(req.query.status); }
+        if (['Request', 'Direct'].includes(req.query.type)) { where.push('t.transfer_type = ?'); params.push(req.query.type); }
+        const q = String(req.query.q || '').trim();
+        if (q) { where.push('(w.full_name LIKE ? OR w.worker_unique_id LIKE ?)'); params.push(`%${q}%`, `%${q}%`); }
+        const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 200));
+        const [rows] = await db.query(
+            `SELECT t.request_id, t.transfer_type, t.status, t.request_reason, t.admin_notes, t.created_at, t.reviewed_at,
+                    DATE_FORMAT(t.effective_date, '%Y-%m-%d') AS effective_date,
+                    t.current_shift_type, t.target_shift_type,
+                    w.worker_id, w.full_name AS worker_name, w.worker_unique_id,
+                    cs.site_name AS current_site_name, ts.site_name AS target_site_name,
+                    u.full_name AS requested_by_name, ru.full_name AS reviewed_by_name
+             FROM worker_transfer_requests t
+             JOIN workers w ON t.worker_id = w.worker_id
+             JOIN sites cs ON t.current_site_id = cs.site_id
+             JOIN sites ts ON t.target_site_id = ts.site_id
+             JOIN users u ON t.requested_by_user_id = u.user_id
+             LEFT JOIN users ru ON ru.user_id = t.reviewed_by_user_id
+             ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+             ORDER BY t.created_at DESC LIMIT ${limit}`,
+            params
+        );
+        res.status(200).json({ status: 'success', data: rows });
+    } catch (error) {
+        console.error('LIST TRANSFERS ERROR:', error);
+        res.status(500).json({ status: 'error', message: 'An error occurred while fetching transfers.' });
     }
 };
 
@@ -196,8 +247,8 @@ exports.reviewTransferRequest = async (req, res) => {
         if (status === 'Approved') {
             // B3: the assignment history uses the explicit business effective date,
             // never the approval moment (NOW()/CURDATE()).
-            //   old assignment: unassigned_date = effective_date  (exclusive end -> last day = effective_date - 1)
-            //   new assignment: assigned_date   = effective_date
+            //   old assignment: unassigned_date = effective_date - 1 (inclusive LAST assigned day)
+            //   new assignment: assigned_date   = effective_date (FIRST day at the new site)
             effectiveDate = req.body.effective_date || (request.effective_date ? String(request.effective_date).slice(0, 10) : null);
             if (!effectiveDate || !isValidDateOnly(effectiveDate)) {
                 throw new TransferError('An effective_date (YYYY-MM-DD) is required to approve this transfer.');
@@ -245,23 +296,32 @@ exports.reviewTransferRequest = async (req, res) => {
                         DATE_FORMAT(assigned_date, '%Y-%m-%d') AS assigned_date,
                         DATE_FORMAT(unassigned_date, '%Y-%m-%d') AS unassigned_date
                  FROM workersiteassignments
-                 WHERE worker_id = ? AND site_id = ? AND shift_type = ?
-                   AND (unassigned_date IS NULL OR unassigned_date > ?)`,
-                [request.worker_id, request.target_site_id, request.target_shift_type, effectiveDate]
+                 WHERE worker_id = ? AND assignment_id <> ?
+                   AND ${overlaps('workersiteassignments', '?', 'NULL')}`,
+                [request.worker_id, oldAssignment.assignment_id, effectiveDate]
             );
+            const [[targetSite0]] = await connection.execute(
+                'SELECT site_status, supports_shifts, site_name FROM sites WHERE site_id = ? LIMIT 1', [request.target_site_id]);
+            if (!targetSite0 || targetSite0.site_status !== 'Active') {
+                throw new TransferError('The target site is not Active.', 409);
+            }
+            if (request.target_shift_type === 'Night' && Number(targetSite0.supports_shifts) !== 1) {
+                throw new TransferError('The target site has no Night shift.', 409);
+            }
             if (targetOpen.length > 0) {
                 const hasOpen = targetOpen.some((a) => a.unassigned_date === null);
                 throw new TransferError(hasOpen
-                    ? 'The worker already has an open assignment at the target site/shift.'
-                    : `The worker already has an assignment at the target site/shift that overlaps ${effectiveDate}.`,
+                    ? 'The worker already has another open assignment.'
+                    : `The worker already has another assignment that overlaps ${effectiveDate}.`,
                     409, { assignment_conflicts: targetOpen });
             }
 
             await connection.execute(
                 `UPDATE workersiteassignments
-                 SET unassigned_date = ?, updated_at = NOW()
+                 SET unassigned_date = ?, ended_by_user_id = ?, ended_at = NOW(),
+                     end_reason = ?, updated_at = NOW()
                  WHERE assignment_id = ? AND unassigned_date IS NULL`,
-                [effectiveDate, oldAssignment.assignment_id]
+                [addDays(effectiveDate, -1), adminId, `Transfer request #${request.request_id}`, oldAssignment.assignment_id]
             );
 
             const [targetSite] = await connection.execute(
@@ -287,11 +347,26 @@ exports.reviewTransferRequest = async (req, res) => {
             );
         }
 
+        if (status === 'Rejected') {
+            if (!admin_notes || !String(admin_notes).trim()) {
+                throw new TransferError('A rejection reason (admin_notes) is required.');
+            }
+            // C-10: rejections are audited like approvals.
+            await connection.execute(
+                `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+                 VALUES ('worker_transfer_requests', ?, 'TRANSFER_REJECTED', ?, ?, ?)`,
+                [request.request_id, adminId, JSON.stringify({ status: 'Pending' }),
+                    JSON.stringify({ status: 'Rejected', admin_notes, rejected_on: businessToday() })]
+            );
+        }
+
+        // C-10: admin_notes holds ONLY the reviewer's note; request_reason is never overwritten.
         await connection.execute(
             `UPDATE worker_transfer_requests 
-             SET status = ?, admin_notes = ?, effective_date = COALESCE(?, effective_date), updated_at = NOW() 
+             SET status = ?, admin_notes = ?, effective_date = COALESCE(?, effective_date),
+                 reviewed_by_user_id = ?, reviewed_at = NOW(), updated_at = NOW() 
              WHERE request_id = ?`,
-            [status, admin_notes || null, effectiveDate, id]
+            [status, admin_notes || null, effectiveDate, adminId, id]
         );
 
         await connection.commit();
@@ -318,7 +393,7 @@ exports.downloadTransferDocument = async (req, res) => {
     try {
         const [[row]] = await db.query(
             `SELECT 
-                t.document_path, t.requested_by_user_id, t.created_at, t.admin_notes,
+                t.document_path, t.requested_by_user_id, t.created_at, t.admin_notes, t.request_reason,
                 t.current_shift_type, t.target_shift_type,
                 w.full_name, w.worker_unique_id, w.job_position, w.nationality, w.phone_number, w.hire_date,
                 cs.site_name AS current_site_name, c.contract_name,
@@ -365,7 +440,8 @@ exports.downloadTransferDocument = async (req, res) => {
                     contractName: row.contract_name,
                     requesterName: row.requester_name,
                     requesterPosition: row.requester_role,
-                    transferReason: row.admin_notes,
+                    // C-10: the document prints the requester's reason, never the admin note.
+                    transferReason: row.request_reason || null,
                 });
 
                 await db.query(

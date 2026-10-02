@@ -55,7 +55,7 @@ function call(handler, req) {
      FROM workersiteassignments wsa
      JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
      JOIN sites s ON s.site_id = wsa.site_id AND s.site_status = 'Active'
-     WHERE wsa.assigned_date <= ? AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date > ?)
+     WHERE wsa.assigned_date <= ? AND (wsa.unassigned_date IS NULL OR wsa.unassigned_date >= ?)
      GROUP BY wsa.site_id, wsa.shift_type`,
     [date, date]
   );
@@ -75,7 +75,7 @@ function call(handler, req) {
   const totalIndep = [...indepMap.values()].reduce((a, b) => a + b, 0);
   check(d.summary.expected === totalIndep, 'Summary expected = independent total', `${d.summary.expected} vs ${totalIndep}`);
 
-  // Same date in the old exclusive/inclusive rule, to show the transfer-day difference.
+  // Assignments whose LAST day (inclusive) is this date: they ARE expected on this date.
   const [[incl]] = await pool.query(
     `SELECT COUNT(*) AS cnt FROM workersiteassignments wsa
      JOIN workers w ON w.worker_id = wsa.worker_id AND w.status = 'Active'
@@ -83,7 +83,7 @@ function call(handler, req) {
      WHERE wsa.assigned_date <= ? AND wsa.unassigned_date = ?`,
     [date, date]
   );
-  console.log(`INFO  assignments ending exactly on ${date} (counted by the OLD dashboard, not by the system): ${incl.cnt}`);
+  console.log(`INFO  assignments whose last assigned day is ${date} (counted as expected): ${incl.cnt}`);
 
   // ---- 3. Site expectations
   const [siteRows] = await pool.query(

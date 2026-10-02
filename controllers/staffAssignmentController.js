@@ -11,7 +11,8 @@
 //   router.delete('/:id/assignments/current', restrictTo('Admin'), staffAssignmentController.unassignCurrent);
 
 const db = require('../config/db');
-const { businessToday } = require('../services/businessDate');
+const { businessToday, addDays } = require('../services/businessDate');
+const { activeOn } = require('../services/assignmentDates');
 
 function isValidDateOnly(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return false;
@@ -87,10 +88,11 @@ exports.assignToSite = async (req, res) => {
     // Close any open assignment (idempotent no-op if same site — still closes
     // and reopens so the history reflects an explicit re-assignment event).
     await connection.execute(
+      // §5: the old assignment's LAST day is the day before the new one starts.
       `UPDATE staff_site_assignments
        SET unassigned_date = ?
        WHERE staff_id = ? AND unassigned_date IS NULL`,
-      [effectiveDate, staffId]
+      [addDays(effectiveDate, -1), staffId]
     );
 
     await connection.execute(
@@ -125,13 +127,18 @@ exports.assignToSite = async (req, res) => {
 // (e.g. a site engineer who becomes a floating supervisor).
 exports.unassignCurrent = async (req, res) => {
   const staffId = Number(req.params.id);
-  const { unassigned_date } = req.body || {};
+  // §5: the date given is the LAST assigned day (inclusive). `unassigned_date`
+  // is accepted as the same meaning for older clients.
+  const lastDay = (req.body || {}).last_day ?? (req.body || {}).unassigned_date;
   const adminId = req.user.user_id;
 
   if (!Number.isInteger(staffId) || staffId <= 0) {
     return res.status(400).json({ status: 'error', message: 'Invalid staff id.' });
   }
-  const effectiveDate = isValidDateOnly(unassigned_date) ? unassigned_date : businessToday();   // B10
+  if (!isValidDateOnly(lastDay)) {
+    return res.status(400).json({ status: 'error', message: 'last_day (YYYY-MM-DD) is required: the LAST day of the current assignment.' });
+  }
+  const effectiveDate = lastDay;
 
   const connection = await db.getConnection();
   try {
@@ -140,8 +147,8 @@ exports.unassignCurrent = async (req, res) => {
     const [result] = await connection.execute(
       `UPDATE staff_site_assignments
        SET unassigned_date = ?
-       WHERE staff_id = ? AND unassigned_date IS NULL`,
-      [effectiveDate, staffId]
+       WHERE staff_id = ? AND unassigned_date IS NULL AND assigned_date <= DATE_ADD(?, INTERVAL 1 DAY)`,
+      [effectiveDate, staffId, effectiveDate]
     );
     if (result.affectedRows === 0) {
       await connection.rollback();

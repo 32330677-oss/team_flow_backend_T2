@@ -19,13 +19,14 @@
 // attendance. Worker and staff records are handled by separate code paths.
 
 const db = require('../config/db');
-const { processQueueItem, businessNow, LOCK_KEY } = require('../services/biometricPunchProcessor');
+const { processQueueItem, businessNow, LOCK_KEY, logProcessing } = require('../services/biometricPunchProcessor');
 const biometricDeviceUserService = require('../services/biometricDeviceUserService');
 const attendanceService = require('../services/attendanceService');
 const { calculateStaffShiftHours, isFriday } = require('../services/staffAttendanceService');
 const { getStaffCompensationForDate } = require('../services/staffCompensationService');
 const { businessToday, isValidDateOnly, addDays } = require('../services/businessDate');
 const { acquireCreateLock, releaseCreateLock } = require('../middleware/duplicateGuard');
+const { assertWorkerDateEditable, assertStaffDateEditable } = require('../services/payrollLock');
 
 const STALE_BATCH_MINUTES = Math.max(5, Number(process.env.BIOMETRIC_STALE_BATCH_MINUTES) || 60);
 
@@ -93,10 +94,21 @@ function isDraftBiometric(target) {
   return Boolean(target && target.source === 'Biometric' && target.status === 'Draft');
 }
 
-function validActions(item, target) {
+// ctx.currentMappingId: mapping that resolves the punch TODAY (may differ from
+// the one recorded on the item, or exist when none was recorded).
+function validActions(item, target, ctx = {}) {
   const status = item.processing_status;
   const result = item.processing_result;
   if (status === 'Failed') return ['retry', 'dismiss'];
+  // D-04: an Invalid (too old) punch can be restored for processing with a reason.
+  if (status === 'Invalid') return result === 'punch_too_old' ? ['restore_for_processing'] : [];
+  // §18: a closed item can be requeued when a (different / new) valid mapping
+  // resolves it now — including an unmapped punch that was Dismissed earlier.
+  if (['Processed', 'Skipped', 'Dismissed'].includes(status)) {
+    const current = ctx.currentMappingId ? Number(ctx.currentMappingId) : null;
+    const used = item.mapping_id ? Number(item.mapping_id) : null;
+    return current && current !== used ? ['requeue'] : (used && !current ? ['requeue'] : []);
+  }
   if (status !== 'NeedsReview') return [];
 
   const base = ['dismiss', 'review_later'];
@@ -125,6 +137,11 @@ function validActions(item, target) {
       break;
     case 'out_far_from_session':
       if (isOpenDraftBiometric(target)) actions.push('use_as_checkout', 'enter_checkout');
+      break;
+    case 'long_duration':
+      // Admin decides explicitly; applying it flags the record for approval review.
+      if (isOpenDraftBiometric(target)) actions.push('use_as_checkout', 'enter_checkout');
+      actions.push('mark_duplicate');
       break;
     default:
       break;
@@ -247,7 +264,9 @@ exports.getDailyReview = async (req, res) => {
     // Items.
     const statuses = includeAll
       ? ['Pending', 'Processed', 'Skipped', 'NeedsReview', 'Invalid', 'Failed', 'Dismissed']
-      : ['NeedsReview', 'Failed'];
+      : req.query.include === 'closed'
+        ? ['NeedsReview', 'Failed', 'Invalid', 'Dismissed']
+        : ['NeedsReview', 'Failed'];
     const placeholders = statuses.map(() => '?').join(',');
     const [items] = await db.execute(
       `SELECT pr.id AS processing_id, pr.punch_id, pr.processing_status, pr.processing_result,
@@ -279,6 +298,7 @@ exports.getDailyReview = async (req, res) => {
           mappingSource = 'current';
         }
       }
+      const currentNow = await biometricDeviceUserService.resolveDeviceUser(item.device_employee_id, toWall(item.punched_at));
       data.push({
         ...item,
         punched_at: toWall(item.punched_at),
@@ -286,7 +306,7 @@ exports.getDailyReview = async (req, res) => {
         mapping,
         mapping_source: mappingSource,
         target,
-        actions: validActions(item, target),
+        actions: validActions(item, target, { currentMappingId: currentNow ? currentNow.mapping_id : null }),
       });
     }
 
@@ -362,7 +382,8 @@ exports.getDailyReview = async (req, res) => {
 async function assertAction(punchId, action) {
   const item = await loadItem(punchId);
   const target = await loadTarget(item.target_table, item.target_record_id);
-  const actions = validActions(item, target);
+  const currentNow = await biometricDeviceUserService.resolveDeviceUser(item.device_employee_id, toWall(item.punched_at));
+  const actions = validActions(item, target, { currentMappingId: currentNow ? currentNow.mapping_id : null });
   if (!actions.includes(action)) {
     throw new OpError(
       `"${action}" is not valid for this item (status ${item.processing_status}, reason ${item.processing_result}).`,
@@ -481,6 +502,11 @@ async function closeItems(punchIds, { userId, newStatus, result, note, actionTyp
           JSON.stringify({ processing_status: item.processing_status, processing_result: item.processing_result }),
           JSON.stringify({ punch_id: punchId, processing_status: newStatus || item.processing_status, note })]
       );
+      await logProcessing(connection, {
+        punchId, event: actionType, status: newStatus || item.processing_status,
+        result: result || item.processing_result, mappingId: item.mapping_id, targetTable: item.target_table,
+        targetRecordId: item.target_record_id, reason: note, userId,
+      });
       closed.push(punchId);
     }
     await connection.commit();
@@ -548,18 +574,31 @@ exports.dismissItems = async (req, res) => {
 // log; the attendance record it created/changed is NOT touched (the admin
 // corrects it through the normal human workflow, see mapping impact).
 // ---------------------------------------------------------------------------
+// §18 / D6 — requeue a closed punch so it is processed again with the mapping
+// that resolves it NOW. Allowed when:
+//   * the item was Processed/Skipped/Dismissed under a mapping that no longer
+//     resolves (voided / ended / replaced), or
+//   * the item had NO mapping (e.g. an unmapped punch that was Dismissed) and
+//     a valid mapping now exists for the punch date.
+// The raw punch, the previous result (auditlogs + processing log) and the
+// Dismiss decision are kept. The attendance record created earlier is NOT
+// touched (corrected through the normal human workflow, see mapping impact).
 exports.requeueItem = async (req, res) => {
   try {
     const userId = requireUser(req);
     const punchId = parsePunchId(req.params.punchId);
     const reason = requireText(req.body?.reason, 'reason');
     const item = await loadItem(punchId);
-    if (!['Processed', 'Skipped', 'Dismissed'].includes(item.processing_status) || !item.mapping_id) {
-      throw new OpError('Only a punch already handled under a recorded mapping can be requeued.', 409);
+    if (!['Processed', 'Skipped', 'Dismissed'].includes(item.processing_status)) {
+      throw new OpError('Only a Processed, Skipped or Dismissed punch can be requeued.', 409);
     }
     const current = await biometricDeviceUserService.resolveDeviceUser(item.device_employee_id, toWall(item.punched_at));
-    if (current && Number(current.mapping_id) === Number(item.mapping_id)) {
-      throw new OpError('The punch still resolves to the same mapping. Correct (end/void) the mapping first.', 409);
+    if (item.mapping_id) {
+      if (current && Number(current.mapping_id) === Number(item.mapping_id)) {
+        throw new OpError('The punch still resolves to the same mapping. Correct (end/void) the mapping first.', 409);
+      }
+    } else if (!current) {
+      throw new OpError('No valid mapping covers this punch date yet. Create the device mapping first, then requeue.', 409);
     }
 
     const result = await withProcessingLock(async () => {
@@ -582,9 +621,14 @@ exports.requeueItem = async (req, res) => {
             JSON.stringify({
               processing_status: item.processing_status, processing_result: item.processing_result,
               mapping_id: item.mapping_id, target_table: item.target_table, target_record_id: item.target_record_id,
+              resolution_note: item.resolution_note,
             }),
             JSON.stringify({ punch_id: punchId, processing_status: 'Pending', reason, new_mapping_id: current?.mapping_id || null })]
         );
+        await logProcessing(connection, {
+          punchId, event: 'BIOMETRIC_PUNCH_REQUEUED', status: 'Pending', result: null,
+          mappingId: current?.mapping_id || null, reason, userId,
+        });
         await connection.commit();
       } catch (error) {
         try { await connection.rollback(); } catch (_) {}
@@ -601,6 +645,68 @@ exports.requeueItem = async (req, res) => {
     });
   } catch (error) {
     return sendError(res, error, 'Failed to requeue the punch.');
+  }
+};
+
+// D-04 — restore an Invalid (too old) punch for processing.
+// The raw punch is never edited; the queue item gets window_override = 1 with
+// who/when/why, goes back to Pending and is processed by the normal pipeline.
+exports.restoreInvalidItem = async (req, res) => {
+  try {
+    const userId = requireUser(req);
+    const punchId = parsePunchId(req.params.punchId);
+    const reason = requireText(req.body?.reason, 'reason');
+    const { item } = await assertAction(punchId, 'restore_for_processing');
+    const result = await withProcessingLock(async () => {
+      const connection = await db.getConnection();
+      try {
+        await connection.beginTransaction();
+        const [upd] = await connection.execute(
+          `UPDATE attendance_punch_processing
+           SET processing_status = 'Pending', window_override = 1, window_override_reason = ?,
+               window_override_by_user_id = ?, window_override_at = ?
+           WHERE punch_id = ? AND processing_status = 'Invalid'`,
+          [reason, userId, businessNow(), punchId]
+        );
+        if (upd.affectedRows !== 1) throw new OpError('The item changed meanwhile. Refresh and try again.', 409);
+        await connection.execute(
+          `INSERT INTO auditlogs (table_name, record_id, action_type, user_id, old_values, new_values)
+           VALUES ('attendance_punch_processing', ?, 'BIOMETRIC_INVALID_RESTORED', ?, ?, ?)`,
+          [item.processing_id, userId, JSON.stringify({ processing_status: 'Invalid', processing_result: item.processing_result }),
+            JSON.stringify({ punch_id: punchId, processing_status: 'Pending', window_override: 1, reason })]
+        );
+        await logProcessing(connection, { punchId, event: 'BIOMETRIC_INVALID_RESTORED', status: 'Pending', reason, userId });
+        await connection.commit();
+      } catch (error) {
+        try { await connection.rollback(); } catch (_) {}
+        throw error;
+      } finally {
+        connection.release();
+      }
+      return processQueueItem(punchId, { userId, allowedStatuses: ['Pending'] });
+    });
+    return actionResponse(res, `Restored and processed: ${result.status} (${result.result}).`, result);
+  } catch (error) {
+    return sendError(res, error, 'Failed to restore the punch.');
+  }
+};
+
+// GET /items/:punchId/history — raw punch + full processing history (H-06).
+exports.getItemHistory = async (req, res) => {
+  try {
+    const punchId = parsePunchId(req.params.punchId);
+    const item = await loadItem(punchId);
+    const [[raw]] = await db.execute(
+      `SELECT id, batch_id, device_employee_id, punched_at, raw_punch_code, punch_type, raw_line, line_number, created_at
+       FROM attendance_punches WHERE id = ?`, [punchId]);
+    const [log] = await db.execute(
+      `SELECT l.log_id, l.event, l.processing_status, l.processing_result, l.processing_error, l.mapping_id,
+              l.target_table, l.target_record_id, l.reason, l.created_at, u.full_name AS user_name
+       FROM attendance_punch_processing_log l LEFT JOIN users u ON u.user_id = l.user_id
+       WHERE l.punch_id = ? ORDER BY l.log_id ASC`, [punchId]);
+    return res.status(200).json({ status: 'success', data: { item, raw_punch: raw, history: log } });
+  } catch (error) {
+    return sendError(res, error, 'Failed to load the punch history.');
   }
 };
 
@@ -775,14 +881,14 @@ async function findOrphanStaffDrafts(executor, { date = null, recordId = null, f
             EXISTS (SELECT 1 FROM staff_supervisor_assignments ssa
                     JOIN users u ON u.user_id = ssa.supervisor_user_id
                     WHERE ssa.staff_id = sa.staff_id AND ssa.assigned_date <= ?
-                      AND (ssa.unassigned_date IS NULL OR ssa.unassigned_date > ?)
+                      AND (ssa.unassigned_date IS NULL OR ssa.unassigned_date >= ?)
                       AND u.status = 'Active' AND u.role = 'StaffSupervisor') AS has_supervisor
      FROM staff_attendance sa
      JOIN staff_members sm ON sm.staff_id = sa.staff_id
      LEFT JOIN staff_site_assignments ssite ON ssite.staff_assignment_id = (
          SELECT x.staff_assignment_id FROM staff_site_assignments x
          WHERE x.staff_id = sa.staff_id AND x.assigned_date <= sa.record_date
-           AND (x.unassigned_date IS NULL OR x.unassigned_date > sa.record_date)
+           AND (x.unassigned_date IS NULL OR x.unassigned_date >= sa.record_date)
          ORDER BY x.assigned_date DESC LIMIT 1)
      LEFT JOIN sites s1 ON s1.site_id = ssite.site_id
      LEFT JOIN sites s2 ON s2.site_id = sm.site_id
@@ -896,6 +1002,7 @@ exports.adminSubmitForReview = async (req, res) => {
       if (rec.status !== 'Draft') throw new OpError(`Only a Draft can be submitted (this record is ${rec.status}).`, 409);
       const [orphan] = await findOrphanWorkerDrafts(connection, { recordId });
       if (!orphan) throw new OpError('This draft has an active supervisor and an Active site. The supervisor must submit it through the normal day submission.', 409);
+      await assertWorkerDateEditable(connection, rec.site_id, rec.record_date);   // D-02
 
       // Normal submission validation (same rules as submitDay).
       if (rec.attendance_status === 'Present') {
@@ -940,6 +1047,7 @@ exports.adminSubmitForReview = async (req, res) => {
       if (rec.status !== 'Draft') throw new OpError(`Only a Draft can be submitted (this record is ${rec.status}).`, 409);
       const [orphan] = await findOrphanStaffDrafts(connection, { recordId });
       if (!orphan) throw new OpError('This draft has an active Staff Supervisor and an Active site. The supervisor must submit it.', 409);
+      await assertStaffDateEditable(connection, rec.record_date);   // D-02
 
       const recordDate = String(rec.record_date).slice(0, 10);
       if (rec.attendance_status === 'Present') {

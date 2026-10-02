@@ -22,5 +22,6 @@ router.patch('/batch/:batchId/mark-paid', controller.markStaffBatchAsPaid);
 const versioning = require('../controllers/staffPayrollVersioningController');
 router.patch('/batch/:batchId/finalize', versioning.finalizeBatch);
 router.post('/batch/:batchId/new-version', versioning.createNewVersion);
+router.patch('/batch/:batchId/void', versioning.voidBatch);
 router.get('/batch/:batchId/versions', versioning.getVersionChain);
 module.exports = router;

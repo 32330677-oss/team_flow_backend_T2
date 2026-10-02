@@ -1,4 +1,5 @@
 const db = require('../config/db');
+const { findLockedWorkerBatch, findLockedStaffBatch } = require('../services/payrollLock');
 const attendanceService = require('../services/attendanceService');
 const { calculateStaffShiftHours, isValidDateOnly } = require('../services/staffAttendanceService');
 const { getStaffCompensationForDate } = require('../services/staffCompensationService');
@@ -107,6 +108,12 @@ async function editRecord(req, res, kind) {
 
     if (rec.source !== 'Biometric') throw new OpError('Only biometric-created records can be edited here.');
     if (!['Draft', 'Submitted'].includes(rec.status)) throw new OpError('Approved records are locked.');
+    // D-02: finalized/paid payroll periods are locked for normal edits.
+    const recDate = String(rec.record_date).slice(0, 10);
+    const lockedBatch = isWorker
+      ? await findLockedWorkerBatch(connection, { siteId: rec.site_id, date: recDate })
+      : await findLockedStaffBatch(connection, { date: recDate });
+    if (lockedBatch) throw new OpError(`${recDate} is inside a finalized/paid payroll period. Use "Correct attendance" instead.`, 409);
 
     if (clearOut) {
       if (rec.status !== 'Draft') {

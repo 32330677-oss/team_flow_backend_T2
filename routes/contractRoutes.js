@@ -8,7 +8,8 @@ const restrictTo = require('../middleware/roleMiddleware'); // استدعاء ا
 router.use(authMiddleware);
 
 // 2. جلب العقود: مسموح للأدمن والمشرف (لأن المشرف قد يحتاج لمعرفة تفاصيل العقد)
-router.get('/project/:projectId', restrictTo('Admin', 'Supervisor'), contractController.getContractsByProject);
+// D-07: contracts carry hourly / overtime rates -> Admin only (not used by the supervisor app).
+router.get('/project/:projectId', restrictTo('Admin'), contractController.getContractsByProject);
 
 // 3. إنشاء عقد جديد: عملية إدارية حساسة (للأدمن فقط)
 router.post('/', restrictTo('Admin'), contractController.createContract);

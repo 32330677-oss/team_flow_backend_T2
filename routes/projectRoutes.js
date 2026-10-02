@@ -9,7 +9,8 @@ router.use(authMiddleware);
 
 // 1. جلب جميع المشاريع:
 // مسموح للأدمن والمشرفين (لكي يتمكن المشرف من رؤية المشاريع الموكلة إليه)
-router.get('/', restrictTo('Admin', 'Supervisor'), projectController.getAllProjects);
+// D-07: least privilege — the supervisor app does not use the project list.
+router.get('/', restrictTo('Admin'), projectController.getAllProjects);
 
 // 2. إنشاء مشروع جديد:
 // عملية إدارية حساسة، للأدمن فقط
